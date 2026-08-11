@@ -63,16 +63,22 @@ http.createServer((req, res) => {
   const chunks = [];
   req.on("data", (c) => chunks.push(c));
   req.on("end", () => {
-    let model = "?", effort = "?", advisor = false;
+    let model = "?", effort = "?", advisor = false, future = false;
     try {
       const j = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       model = j.model ?? "?";
       effort = j.output_config?.effort ?? "?";
       advisor = Array.isArray(j.tools) && j.tools.some((t) => /^advisor_/.test(t.type ?? ""));
+      future = Array.isArray(j.tools) && j.tools.some((t) => t.type === "web_search_20260401");
     } catch {}
     if (advisor) {
       res.writeHead(400, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: "Failed to deserialize the JSON body into the target type: tools[249]: unknown variant `advisor_20260301`, expected `web_search_20250305` or `web_search_20260209` at line 1 column 393737", type: "invalid_request_error", param: null, code: "invalid_request_error" } }));
+      return;
+    }
+    if (future) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Failed to deserialize the JSON body into the target type: tools[0]: unknown variant `web_search_20260401`, expected `web_search_20250305` or `web_search_20260209` at line 1 column 100", type: "invalid_request_error", param: null, code: "invalid_request_error" } }));
       return;
     }
     const text = `ROUTED:${model} EFFORT:${effort}`;
@@ -177,6 +183,15 @@ if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8008 --
   check "T10 advisor tool dropped, request reaches mock" 'echo "$AD" | grep -q "ROUTED:"'
 else
   echo "FAIL T10 could not start proxy on 8008"
+fi
+
+# T12 unknown-variant retry: non-advisor tool rejected by mock 400, proxy
+# splices tools[N] from the error message and retries (runtime, not preflight)
+if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8009 --port 8009 --redir; then
+  RT="$(curl -s --max-time 5 -X POST http://localhost:8009/v1/messages -H "content-type: application/json" -d '{"model":"claude-sonnet-4-5","tools":[{"type":"web_search_20260401","name":"web_search"}],"messages":[{"role":"user","content":"x"}]}')"
+  check "T12 unknown variant spliced and retried" 'echo "$RT" | grep -q "ROUTED:"'
+else
+  echo "FAIL T12 could not start proxy on 8009"
 fi
 
 # T8 forward fallback: dead deepseek -> real anthropic

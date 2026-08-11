@@ -34,7 +34,8 @@ Then start Claude Code and pick a model with `/model`.
 - **Effort mapping** — Opus 5 / Claude Code send `low|medium|high|xhigh|max`; DeepSeek V4 only accepts `low|high|max`. The proxy bridges the missing levels (`medium` → `high`, `xhigh` → `max`), so your effort preference is honored instead of silently ignored upstream. Override per level in `config.yml`.
 - **Instant `count_tokens`** — Claude Code's housekeeping call is answered locally with a fast estimate instead of hitting an undocumented endpoint.
 - **Model aliases** — short names (`v4flash`, `v4-flash`, `v4pro`, `v4-pro`) are normalized to their `deepseek-*` ids wherever you configure models.
-- **Silent by design** — no request logging, no audit files, no terminal noise.
+- **Usage observability** — every DeepSeek request appends one JSON line with the real input/cache/output token counts to `logs/proxy-usage.jsonl`. Message content and auth headers are never logged.
+- **Tool compat** — server tools Claude Code ships that DeepSeek's schema doesn't know (e.g. `advisor_20260301`) are dropped before forwarding; any other unknown variant is spliced out at runtime from the 400 error and retried.
 - **Resilient** — if Anthropic's model list hiccups, the proxy still serves DeepSeek models. Your session is never bricked.
 
 ## Quickstart
@@ -87,7 +88,7 @@ ANTHROPIC_BASE_URL=http://localhost:8016 claude
 
 ### The `claudei.sh` launcher
 
-`claudei.sh` is a convenience launcher: it updates the `claude` CLI, starts the proxy on `:8016` (reusing it if already running), and boots Claude Code with gateway discovery enabled plus the DeepSeek V4 1M context window, so the status-line context percentage reflects the real window instead of Claude Code's 200k fallback for unknown models.
+`claudei.sh` is a convenience launcher: it updates the `claude` CLI, starts the proxy on `:8016` (reusing it if already running), and boots Claude Code with gateway discovery enabled plus the DeepSeek V4 1M context window, so the status-line context percentage reflects the real window instead of Claude Code's 200k fallback for unknown models. 256k-token payloads are verified working; treat 1M as the ceiling the launcher claims, not a measured guarantee.
 
 The `claude` invocation is plain and easy to customize — edit the launch line to suit your setup. Common tweaks:
 
@@ -175,6 +176,14 @@ Use it to confirm Claude Code is actually requesting `/v1/models`, which display
 ```bash
 tail -f /tmp/deepseek-proxy-payloads.jsonl
 ```
+
+Real token accounting — input, cache-creation, cache-read, output — lands per request in `logs/proxy-usage.jsonl` (always on, no flags needed):
+
+```bash
+tail -f logs/proxy-usage.jsonl
+```
+
+For full request/response captures (every tool definition, the system prompt, SSE events) the repo ships `scripts/observe.mjs` (sniff proxy for either backend) and `scripts/probe.mjs` (a `claude -p` matrix runner); see `docs/probe-findings.md` for what a probe run looks like and what was learned from it.
 
 ## Security
 

@@ -1,5 +1,6 @@
 logs/
 .env
 config.yml
+.serena/
 
 .DS_Store
