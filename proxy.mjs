@@ -1,15 +1,24 @@
 /**
- * agent-proxy — see what Claude Code actually sends the model.
+ * deepseek-in-claude — DeepSeek models inside Claude Code.
  *
- * A zero-dependency logging proxy for Claude Code. It sits between the CLI and
- * the Anthropic API, forwards every request untouched (auth header and all),
- * streams the response straight back so the CLI is unaffected, and for each
- * request writes a readable Markdown document — led by a ranked table of what
- * is eating your context.
+ * A zero-dependency local proxy for Claude Code. It merges the Anthropic model
+ * list with the DeepSeek model list so DeepSeek models appear in the Claude
+ * Code model picker, then forwards DeepSeek-model traffic to DeepSeek's
+ * Anthropic-compatible endpoint (https://api.deepseek.com/anthropic) with the
+ * DeepSeek key substituted — no protocol translation needed, the CLI sees
+ * native Anthropic SSE either way. Anthropic-model traffic still passes
+ * through untouched.
  *
  * Run:   node proxy.mjs
  * Point Claude Code at it:
  *   ANTHROPIC_BASE_URL=http://localhost:8787 claude
+ *
+ * Config lives in .env (or real env vars):
+ *   DEEPSEEK_API_KEY=...
+ *   DEEPSEEK_BASE_URL=https://api.deepseek.com
+ *   DEEPSEEK_MODEL=deepseek-v4-flash        # comma-separated fallbacks
+ *   DEEPSEEK_ANTHROPIC_BASE_URL=           # optional override, defaults to
+ *                                          #   $DEEPSEEK_BASE_URL/anthropic
  *
  * Zero runtime dependencies — Node built-ins only. Requires Node 18+.
  */
@@ -24,17 +33,43 @@ const PORT = Number(process.env.PORT ?? 8787);
 const UPSTREAM = "api.anthropic.com";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const LOG_DIR = path.join(HERE, "logs");
 
-/** Rough token estimate for display. Real input tokens come from the response
- * usage; this is only for ranking the request before the reply arrives. */
+// ---------------------------------------------------------------------------
+// Config from .env (real env vars win)
+// ---------------------------------------------------------------------------
+
+function loadEnv() {
+  const out = {};
+  try {
+    const raw = fs.readFileSync(path.join(HERE, ".env"), "utf8");
+    for (const line of raw.split(/\r?\n/)) {
+      const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+      if (m) out[m[1]] = m[2].trim().replace(/^["']|["']$/g, "");
+    }
+  } catch {
+    /* no .env */
+  }
+  return out;
+}
+
+const ENV = loadEnv();
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY ?? ENV.DEEPSEEK_API_KEY ?? "";
+const DEEPSEEK_BASE_URL = (process.env.DEEPSEEK_BASE_URL ?? ENV.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com").replace(/\/+$/, "");
+const DEEPSEEK_ANTHROPIC_BASE = (process.env.DEEPSEEK_ANTHROPIC_BASE_URL ?? `${DEEPSEEK_BASE_URL}/anthropic`).replace(/\/+$/, "");
+const DEEPSEEK_MODEL = (process.env.DEEPSEEK_MODEL ?? ENV.DEEPSEEK_MODEL ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const FALLBACK_MODELS = ["deepseek-v4-pro", "deepseek-v4-flash"];
+const DEFAULT_MODELS = DEEPSEEK_MODEL.length ? DEEPSEEK_MODEL : FALLBACK_MODELS;
+
+/** Rough token estimate for count_tokens. */
 const estTokens = (bytes) => Math.round(bytes / 4);
 
-/** count_tokens calls send content but get back only a number, never a reply.
- * A single turn fires many as housekeeping — pure noise here, so skip them. */
+/** count_tokens is a housekeeping call Claude Code fires constantly. DeepSeek's
+ * Anthropic endpoint does not document it, so answer locally with an estimate. */
 const isTokenCount = (reqPath) => reqPath.includes("count_tokens");
-
-const REDACT = new Set(["authorization", "x-api-key", "api-key"]);
 
 /** Strip hop-by-hop and encoding headers so the captured response is readable,
  * recompute content-length, and pass auth through untouched so the real request
@@ -50,210 +85,219 @@ function forwardHeaders(headers, body) {
   return out;
 }
 
-function baseName() {
-  const stamp = new Date().toISOString().replace(/:/g, "-").replace(".", "-").replace("Z", "");
-  return `${stamp}_anthropic`;
+/** Strip hop-by-hop/framing headers from an upstream response so Node
+ * re-frames the client stream — verbatim passthrough corrupts SSE framing. */
+function cleanResponseHeaders(headers) {
+  const out = { ...headers };
+  delete out["connection"];
+  delete out["transfer-encoding"];
+  delete out["content-encoding"]; // we forced identity upstream
+  return out;
 }
 
-// ---------------------------------------------------------------------------
-// The audit: rank what's in the request
-// ---------------------------------------------------------------------------
-
-/** Measure every removable region of the request and rank the tools by size.
- * This is the whole point of the proxy — the numbers you cut against. */
-function auditRequest(reqJson, realInputTokens) {
-  const tools = Array.isArray(reqJson?.tools) ? reqJson.tools : [];
-  const toolRows = tools
-    .map((t) => {
-      const bytes = Buffer.byteLength(JSON.stringify(t));
-      return { name: t?.name ?? "(unnamed)", bytes, tokens: estTokens(bytes) };
-    })
-    .sort((a, b) => b.bytes - a.bytes);
-
-  const toolsBytes = toolRows.reduce((n, r) => n + r.bytes, 0);
-  const systemBytes = reqJson?.system ? Buffer.byteLength(JSON.stringify(reqJson.system)) : 0;
-  const totalBytes = Buffer.byteLength(JSON.stringify(reqJson ?? {}));
-
-  return {
-    toolRows,
-    toolCount: toolRows.length,
-    toolsBytes,
-    systemBytes,
-    totalBytes,
-    realInputTokens,
-  };
-}
-
-/** The ranked table, as Markdown. The hero of the whole document. */
-function renderAudit(a) {
-  const pct = (b) => (a.totalBytes ? ((b / a.totalBytes) * 100).toFixed(1) : "0.0");
-  const rows = a.toolRows
-    .map((r) => `| ${r.name} | ${r.bytes.toLocaleString()} | ~${r.tokens.toLocaleString()} | ${pct(r.bytes)}% |`)
-    .join("\n");
-
-  return [
-    "<audit>",
-    "",
-    a.realInputTokens != null
-      ? `**${a.realInputTokens.toLocaleString()} input tokens** billed for this request (from the response usage).`
-      : "",
-    "",
-    `- **tools**: ${a.toolCount} definitions, ${a.toolsBytes.toLocaleString()} bytes (~${estTokens(a.toolsBytes).toLocaleString()} tokens)`,
-    `- **system prompt**: ${a.systemBytes.toLocaleString()} bytes (~${estTokens(a.systemBytes).toLocaleString()} tokens)`,
-    `- **total request**: ${a.totalBytes.toLocaleString()} bytes`,
-    "",
-    "**Tools, ranked by size — this is your cut list:**",
-    "",
-    "| tool | bytes | ~tokens | % of request |",
-    "| --- | --: | --: | --: |",
-    rows,
-    "",
-    "</audit>",
-  ].join("\n");
-}
-
-/** The same ranking, compact, for the terminal — so you see the bloat live. */
-function printAudit(a, base) {
-  const top = a.toolRows.slice(0, 12);
-  const w = Math.max(4, ...top.map((r) => r.name.length));
-  console.log(`\n[agent-proxy] ${a.toolCount} tools · ${a.toolsBytes.toLocaleString()} tool bytes` +
-    (a.realInputTokens != null ? ` · ${a.realInputTokens.toLocaleString()} real input tokens` : ""));
-  for (const r of top) {
-    console.log(`  ${r.name.padEnd(w)}  ${String(r.bytes).padStart(7)} B  ~${r.tokens} tok`);
-  }
-  if (a.toolRows.length > top.length) console.log(`  … ${a.toolRows.length - top.length} more`);
-  console.log(`  logs/${base}.md\n`);
-}
-
-// ---------------------------------------------------------------------------
-// Readable Markdown render (Anthropic /messages only)
-// ---------------------------------------------------------------------------
-
-const fenceJson = (v) => "```json\n" + JSON.stringify(v, null, 2) + "\n```";
-const fence = (t, lang = "") => "```" + lang + "\n" + t + "\n```";
-
-function blockText(b) {
-  if (typeof b === "string") return b;
-  if (b?.type === "text" && typeof b.text === "string") return b.text;
-  return "";
-}
-
-function renderSystem(system) {
-  if (typeof system === "string") return system;
-  if (Array.isArray(system)) {
-    return system
-      .map((b) => blockText(b) + (b?.cache_control ? "\n\n<!-- cache_control breakpoint -->" : ""))
-      .join("\n\n");
-  }
-  return fenceJson(system);
-}
-
-function renderTools(tools) {
-  const rendered = tools.map((t) => {
-    const lines = [`### ${t.name ?? "(unnamed tool)"}`, ""];
-    if (t.description) lines.push(t.description, "");
-    if (t.input_schema) lines.push(fenceJson(t.input_schema));
-    return lines.join("\n");
-  });
-  return ["<tools>", "", rendered.join("\n\n"), "", "</tools>"].join("\n");
-}
-
-function imagePlaceholder(b) {
-  const src = b.source ?? {};
-  const bytes = typeof src.data === "string" ? src.data.length : 0;
-  return `\`[image: ${src.media_type ?? "unknown"}, ${bytes} base64 chars — full data in .request.txt]\``;
-}
-
-function renderContent(content) {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return fenceJson(content);
-  return content
-    .map((b) => {
-      switch (b?.type) {
-        case "text":
-          return b.text ?? "";
-        case "tool_use":
-          return [`<tool-use name="${b.name}" id="${b.id ?? ""}">`, "", fenceJson(b.input ?? {}), "", "</tool-use>"].join("\n");
-        case "tool_result": {
-          const inner =
-            typeof b.content === "string"
-              ? b.content
-              : Array.isArray(b.content)
-                ? b.content.map((x) => (x?.type === "image" ? imagePlaceholder(x) : blockText(x) || fenceJson(x))).join("\n\n")
-                : fenceJson(b.content);
-          return [`<tool-result tool-use-id="${b.tool_use_id ?? ""}" is-error="${!!b.is_error}">`, "", inner, "", "</tool-result>"].join("\n");
-        }
-        case "image":
-          return imagePlaceholder(b);
-        case "thinking":
-          return ["<thinking>", "", b.thinking ?? "", "", "</thinking>"].join("\n");
-        default:
-          return fenceJson(b);
+function fetchJson(url, options = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const lib = u.protocol === "https:" ? https : http;
+    const headers = { ...(options.headers ?? {}) };
+    const body = options.body ? Buffer.from(options.body) : null;
+    if (body) headers["content-length"] = String(body.length);
+    const req = lib.request(
+      { hostname: u.hostname, port: u.port || (u.protocol === "https:" ? 443 : 80), path: u.pathname + u.search, method: options.method ?? "GET", headers },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          const raw = Buffer.concat(chunks).toString("utf8");
+          let json = null;
+          try {
+            json = JSON.parse(raw);
+          } catch {
+            /* non-JSON body */
+          }
+          resolve({ status: res.statusCode ?? 0, json, raw });
+        });
       }
-    })
-    .join("\n\n");
+    );
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
 }
 
-function renderMessages(messages) {
-  if (!Array.isArray(messages)) return "<messages></messages>";
-  const rendered = messages.map((m, i) =>
-    [`<message index="${i + 1}" role="${m.role ?? "unknown"}">`, "", renderContent(m.content), "", "</message>"].join("\n")
-  );
-  return ["<messages>", "", rendered.join("\n\n"), "", "</messages>"].join("\n");
+function sendError(res, status, type, message) {
+  if (!res.headersSent) res.writeHead(status ?? 500, { "content-type": "application/json" });
+  res.end(JSON.stringify({ type: "error", error: { type: type ?? "api_error", message } }));
 }
 
-/** Reassemble the streamed SSE response so we can read the reply — and pull the
- * real input-token count out of the usage events. */
-function decodeResponse(raw) {
-  const events = [];
-  for (const line of raw.split(/\r?\n/)) {
-    const m = line.match(/^data:\s?(.*)$/);
-    if (!m || m[1] === "[DONE]" || m[1].trim() === "") continue;
-    try { events.push(JSON.parse(m[1])); } catch { /* skip */ }
-  }
-  const blocks = {};
-  let stopReason, usage;
-  for (const ev of events) {
-    if (ev.type === "content_block_start") blocks[ev.index] = { type: ev.content_block?.type ?? "text", text: "", name: ev.content_block?.name, id: ev.content_block?.id };
-    else if (ev.type === "content_block_delta" && blocks[ev.index]) {
-      const d = ev.delta ?? {};
-      blocks[ev.index].text += d.text ?? d.partial_json ?? d.thinking ?? "";
-    } else if (ev.type === "message_start" && ev.message?.usage) usage = { ...ev.message.usage, ...(usage ?? {}) };
-    else if (ev.type === "message_delta") {
-      if (ev.delta?.stop_reason) stopReason = ev.delta.stop_reason;
-      if (ev.usage) usage = { ...(usage ?? {}), ...ev.usage };
+// ---------------------------------------------------------------------------
+// DeepSeek model list — live from the API, cached, fallback to .env
+// ---------------------------------------------------------------------------
+
+const MODEL_CACHE_TTL = 10 * 60 * 1000;
+let dsModelsCache = { at: 0, models: null };
+let deepseekIds = new Set(DEFAULT_MODELS);
+
+function toModelEntry(id, created) {
+  return { id, display_name: `DeepSeek ${id}`, created_at: created || Math.floor(Date.now() / 1000), type: "model" };
+}
+
+async function deepseekModelList() {
+  if (dsModelsCache.models && Date.now() - dsModelsCache.at < MODEL_CACHE_TTL) return dsModelsCache.models;
+  const models = new Map();
+  for (const id of DEFAULT_MODELS) models.set(id, toModelEntry(id, 0));
+  if (DEEPSEEK_API_KEY) {
+    try {
+      const { status, json } = await fetchJson(`${DEEPSEEK_BASE_URL}/models`, {
+        headers: { authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+      });
+      if (status === 200 && json?.data) {
+        for (const m of json.data) if (m?.id) models.set(m.id, toModelEntry(m.id, m.created ?? 0));
+      }
+    } catch {
+      /* models fetch failed — fallback list stands */
     }
   }
-  const parts = [];
-  if (stopReason) parts.push(`- **stop reason**: ${stopReason}`);
-  if (usage) parts.push(`- **usage**: ${JSON.stringify(usage)}`, "");
-  for (const i of Object.keys(blocks).map(Number).sort((a, b) => a - b)) {
-    const b = blocks[i];
-    if (b.type === "text") parts.push(["<assistant-text>", "", b.text, "", "</assistant-text>"].join("\n"));
-    else if (b.type === "thinking") parts.push(["<thinking>", "", b.text, "", "</thinking>"].join("\n"));
-    else if (b.type === "tool_use") parts.push([`<tool-use name="${b.name}" id="${b.id ?? ""}">`, "", fence(b.text || "{}", "json"), "", "</tool-use>"].join("\n"));
-  }
-  const inputTokens = usage
-    ? (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0)
-    : null;
-  return { markdown: parts.length ? parts.join("\n\n") : fence(raw), inputTokens };
+  const list = [...models.values()];
+  dsModelsCache = { at: Date.now(), models: list };
+  return list;
 }
 
-function renderMarkdown(c, audit, responseMd) {
-  const headers = Object.entries(c.headers).map(([k, v]) =>
-    `${k}: ${REDACT.has(k.toLowerCase()) ? "[REDACTED]" : Array.isArray(v) ? v.join(", ") : v ?? ""}`
+async function refreshDeepseekIds() {
+  try {
+    deepseekIds = new Set((await deepseekModelList()).map((m) => m.id));
+  } catch {
+    /* keep fallback */
+  }
+}
+refreshDeepseekIds();
+
+const isDeepSeekModel = (id) => deepseekIds.has(id);
+
+/** Claude Code effort levels: low, medium, high, xhigh, max. DeepSeek
+ * documents low/medium/high/max only — fold xhigh into max so effort is
+ * actually honored instead of silently ignored upstream. */
+const EFFORT_MAP = { xhigh: "max" };
+
+// ---------------------------------------------------------------------------
+// DeepSeek routing — transparent passthrough to the Anthropic-compatible API
+// ---------------------------------------------------------------------------
+
+function handleDeepSeek(req, res, body, reqPath) {
+  if (isTokenCount(reqPath)) {
+    const est = estTokens(body.length);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ input_tokens: est }));
+    return;
+  }
+
+  let forwardedBody = body;
+  try {
+    const reqJson = JSON.parse(body.toString("utf8"));
+    if (reqJson?.output_config?.effort && EFFORT_MAP[reqJson.output_config.effort]) {
+      reqJson.output_config.effort = EFFORT_MAP[reqJson.output_config.effort];
+      forwardedBody = Buffer.from(JSON.stringify(reqJson));
+    }
+  } catch {
+    /* leave body untouched */
+  }
+
+  const headers = forwardHeaders(req.headers, forwardedBody);
+  headers["x-api-key"] = DEEPSEEK_API_KEY;
+  delete headers["authorization"]; // DeepSeek wants the key as x-api-key only
+  // anthropic-version / anthropic-beta pass through; DeepSeek ignores them.
+
+  let u;
+  try {
+    u = new URL(DEEPSEEK_ANTHROPIC_BASE + reqPath);
+  } catch (err) {
+    sendError(res, 500, "api_error", `deepseek route error: ${err.message}`);
+    return;
+  }
+
+  const lib = u.protocol === "https:" ? https : http;
+  const upstream = lib.request(
+    { hostname: u.hostname, port: u.port || (u.protocol === "https:" ? 443 : 80), path: u.pathname + u.search, method: req.method ?? "POST", headers },
+    (up) => {
+      res.writeHead(up.statusCode ?? 502, cleanResponseHeaders(up.headers));
+      up.on("data", (c) => res.write(c));
+      up.on("end", () => res.end());
+    }
   );
-  const req = c.reqJson;
-  const parts = [
-    ["<meta>", "", `- **timestamp**: ${c.timestamp}`, `- **model**: ${req?.model ?? "unknown"}`, `- **endpoint**: ${c.method} ${c.path}`, `- **upstream status**: ${c.statusCode}`, "", "</meta>"].join("\n"),
-    renderAudit(audit),
-    ["<headers>", "", "```", ...headers, "```", "", "</headers>"].join("\n"),
-  ];
-  if (req?.system != null) parts.push(["<system-prompt>", "", renderSystem(req.system), "", "</system-prompt>"].join("\n"));
-  if (Array.isArray(req?.tools) && req.tools.length) parts.push(renderTools(req.tools));
-  parts.push(renderMessages(req?.messages));
-  parts.push("<response>\n\n" + responseMd + "\n\n</response>");
-  return parts.join("\n\n") + "\n";
+  upstream.on("error", (err) => {
+    if (res.headersSent) { res.destroy(); return; }
+    sendError(res, 502, "api_error", `deepseek upstream error: ${err.message}`);
+  });
+  if (forwardedBody.length > 0) upstream.write(forwardedBody);
+  upstream.end();
+}
+
+// ---------------------------------------------------------------------------
+// Merged model list
+// ---------------------------------------------------------------------------
+
+async function serveModels(req, res) {
+  const anthropicModels = await new Promise((resolve) => {
+    const upstream = https.request(
+      { hostname: UPSTREAM, port: 443, path: req.url ?? "/v1/models", method: "GET", headers: forwardHeaders(req.headers, Buffer.alloc(0)) },
+      (up) => {
+        const chunks = [];
+        up.on("data", (c) => chunks.push(c));
+        up.on("end", () => {
+          let json = null;
+          try {
+            json = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          } catch {
+            /* non-JSON body */
+          }
+          resolve({ status: up.statusCode ?? 0, json });
+        });
+      }
+    );
+    upstream.on("error", () => resolve({ status: 0, json: null }));
+    upstream.end();
+  });
+
+  const ds = await deepseekModelList();
+  deepseekIds = new Set(ds.map((m) => m.id));
+
+  // Never brick the harness on an Anthropic hiccup — serve DeepSeek models only.
+
+  const data = Array.isArray(anthropicModels.json?.data) ? [...anthropicModels.json.data] : [];
+  const seen = new Set(data.map((m) => m.id));
+  for (const m of ds) if (!seen.has(m.id)) data.push(m);
+
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(
+    JSON.stringify({
+      data,
+      has_more: false,
+      first_id: data[0]?.id ?? null,
+      last_id: data[data.length - 1]?.id ?? null,
+    })
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Anthropic forward
+// ---------------------------------------------------------------------------
+
+function forwardToAnthropic(req, res, reqPath, body) {
+  const upstream = https.request(
+    { hostname: UPSTREAM, port: 443, path: reqPath, method: req.method, headers: forwardHeaders(req.headers, body) },
+    (up) => {
+      res.writeHead(up.statusCode ?? 502, cleanResponseHeaders(up.headers));
+      up.on("data", (c) => res.write(c));
+      up.on("end", () => res.end());
+    }
+  );
+  upstream.on("error", (err) => {
+    if (res.headersSent) { res.destroy(); return; }
+    res.writeHead(502, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: `agent-proxy upstream error: ${err.message}` }));
+  });
+  if (body.length > 0) upstream.write(body);
+  upstream.end();
 }
 
 // ---------------------------------------------------------------------------
@@ -264,45 +308,26 @@ function handle(req, res) {
   const reqPath = req.url ?? "/";
   const chunks = [];
   req.on("data", (c) => chunks.push(c));
-  req.on("end", () => {
+  req.on("end", async () => {
     const body = Buffer.concat(chunks);
-    const timestamp = new Date().toISOString();
-    const base = baseName();
-
-    const upstream = https.request(
-      { hostname: UPSTREAM, port: 443, path: reqPath, method: req.method, headers: forwardHeaders(req.headers, body) },
-      (up) => {
-        res.writeHead(up.statusCode ?? 502, up.headers);
-        const respChunks = [];
-        up.on("data", (c) => { respChunks.push(c); res.write(c); });
-        up.on("end", () => {
-          res.end();
-          if (isTokenCount(reqPath)) return;
-          try {
-            const reqJson = JSON.parse(body.toString("utf8"));
-            const { markdown, inputTokens } = decodeResponse(Buffer.concat(respChunks).toString("utf8"));
-            const audit = auditRequest(reqJson, inputTokens);
-            fs.mkdirSync(LOG_DIR, { recursive: true });
-            fs.writeFileSync(path.join(LOG_DIR, `${base}.request.txt`), body.toString("utf8"));
-            fs.writeFileSync(path.join(LOG_DIR, `${base}.md`), renderMarkdown({ reqJson, timestamp, method: req.method ?? "POST", path: reqPath, statusCode: up.statusCode ?? 0, headers: req.headers }, audit, markdown));
-            printAudit(audit, base);
-          } catch (err) {
-            console.error(`[agent-proxy] could not render (non-JSON body?): ${err.message}`);
-          }
-        });
+    try {
+      if (req.method === "GET" && reqPath.startsWith("/v1/models")) {
+        await serveModels(req, res);
+        return;
       }
-    );
-    upstream.on("error", (err) => {
-      console.error(`[agent-proxy] upstream error: ${err.message}`);
-      if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: `agent-proxy upstream error: ${err.message}` }));
-    });
-    if (body.length > 0) upstream.write(body);
-    upstream.end();
+      let model = null;
+      if (body.length > 0) {
+        try { model = JSON.parse(body.toString("utf8"))?.model ?? null; } catch { /* not JSON */ }
+      }
+      if (model && isDeepSeekModel(model)) {
+        handleDeepSeek(req, res, body, reqPath);
+        return;
+      }
+      forwardToAnthropic(req, res, reqPath, body);
+    } catch (err) {
+      sendError(res, 500, "api_error", `proxy handler error: ${err.message}`);
+    }
   });
 }
 
-http.createServer(handle).listen(PORT, () => {
-  console.log(`[agent-proxy] listening on http://localhost:${PORT}`);
-  console.log(`[agent-proxy] point Claude Code at it:  ANTHROPIC_BASE_URL=http://localhost:${PORT} claude`);
-});
+http.createServer(handle).listen(PORT);

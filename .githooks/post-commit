@@ -1,0 +1,10 @@
+#!/bin/sh
+# post-commit: bump version from the real commit message (COMMIT_EDITMSG),
+# amend so the bump lands in the commit, then tag.
+if [ -n "$SKIP_AV" ]; then exit 0; fi
+root="$(git rev-parse --show-toplevel)"
+node "$root/scripts/autoversion.mjs"
+if [ $? -eq 1 ]; then
+  SKIP_AV=1 git commit --amend --no-verify --no-edit
+fi
+node "$root/scripts/tag.mjs"
