@@ -18,3 +18,15 @@ redir:
 # retry the other way using the same redir relation — DeepSeek <-> Anthropic.
 # Implied by `--redir`; set false to disable.
 fallback: true
+
+# Log every request/response shape to /tmp/deepseek-proxy-payloads.jsonl.
+# Equivalent to `--debug` on the CLI. Content and auth headers never logged.
+debug: false
+
+# Bridge Opus 5 / Claude Code effort levels DeepSeek doesn't support to the
+# nearest DeepSeek level. Opus 5 sends low|medium|high|xhigh|max; DeepSeek V4
+# accepts low|high|max only. Unsupported keys fall back to the defaults shown;
+# this block overrides them per key.
+effort:
+  medium: high  # Opus "medium" -> DeepSeek "high"
+  xhigh: max    # Opus "xhigh"  -> DeepSeek "max"

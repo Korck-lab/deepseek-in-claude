@@ -31,7 +31,7 @@ Then start Claude Code and pick a model with `/model`.
 - **DeepSeek in the model picker** — models are fetched live from the DeepSeek API (10-minute cache) and merged into Anthropic's model list, so `deepseek-v4-flash` and `deepseek-v4-pro` show up natively and you select them with `/model` like any other model.
 - **No protocol translation** — DeepSeek exposes an Anthropic-compatible endpoint, so the proxy forwards native Anthropic SSE. There is no adapter layer to break or debug.
 - **Key isolation** — `DEEPSEEK_API_KEY` is injected as `x-api-key` only on the DeepSeek leg, and `authorization` is dropped there. Anthropic calls keep your normal Claude Code auth untouched.
-- **Effort mapping** — Claude Code's `xhigh` effort folds into DeepSeek's `max`, so your effort preference is honored instead of silently ignored.
+- **Effort mapping** — Opus 5 / Claude Code send `low|medium|high|xhigh|max`; DeepSeek V4 only accepts `low|high|max`. The proxy bridges the missing levels (`medium` → `high`, `xhigh` → `max`), so your effort preference is honored instead of silently ignored upstream. Override per level in `config.yml`.
 - **Instant `count_tokens`** — Claude Code's housekeeping call is answered locally with a fast estimate instead of hitting an undocumented endpoint.
 - **Model aliases** — short names (`v4flash`, `v4-flash`, `v4pro`, `v4-pro`) are normalized to their `deepseek-*` ids wherever you configure models.
 - **Silent by design** — no request logging, no audit files, no terminal noise.
@@ -74,7 +74,16 @@ node proxy.mjs
 ANTHROPIC_BASE_URL=http://localhost:8016 claude
 ```
 
-Then run `/model` and pick `deepseek-v4-flash` (or `deepseek-v4-pro`). Anthropic models still work — they pass through with your normal auth.
+Then run `/model` and pick `DeepSeek V4 Flash` (or `DeepSeek V4 Pro`). Anthropic models still work — they pass through with your normal auth.
+
+For the `/model` picker to list the DeepSeek models, Claude Code must run in gateway-discovery mode. The proxy ships `claudei.sh` which sets the required flags — or set them yourself:
+
+```bash
+CLAUDE_CODE_USE_GATEWAY=1 \
+CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 \
+ANTHROPIC_AUTH_TOKEN=local-deepseek-proxy \
+ANTHROPIC_BASE_URL=http://localhost:8016 claude
+```
 
 ## How it works
 
@@ -83,6 +92,12 @@ Claude Code speaks Anthropic SSE. The proxy:
 1. Intercepts `/v1/models` and merges the live Anthropic model list with the live DeepSeek list.
 2. For every request whose `model` is a DeepSeek id, rewrites `authorization` → `x-api-key` and forwards to `$DEEPSEEK_ANTHROPIC_BASE_URL` (default `https://api.deepseek.com/anthropic`).
 3. Streams everything else through to `api.anthropic.com` untouched.
+
+### Why the picker shows `claude-deepseek-*` ids
+
+Claude Code's gateway model discovery (opt-in since 2.1.129) drops any model whose id fails `/(claude|anthropic)/i` before it reaches the `/model` picker — so a bare `deepseek-v4-flash` is silently filtered out. The proxy therefore serves DeepSeek models under `claude-deepseek-*` display ids (which pass the filter) with a friendly `DeepSeek V4 Flash` label, and rewrites them back to the real id (`deepseek-v4-flash`) on every upstream request. Both the display id and the real id route to DeepSeek.
+
+The discovery result is cached by Claude Code under `~/.claude/cache/gateway-models.json` keyed by base URL. After changing the proxy's model list, delete that file or restart.
 
 ## Redirect & fallback
 
@@ -104,7 +119,13 @@ redir:
   opus: deepseek-v4-flash
   fable: deepseek-v4-pro
 fallback: true
+debug: false
+effort:
+  medium: high
+  xhigh: max
 ```
+
+The `effort` block bridges Opus 5 / Claude Code effort levels that DeepSeek doesn't support (`medium` and `xhigh`) to the nearest DeepSeek level. Keys you don't list keep the defaults above.
 
 ## Configuration
 
@@ -126,6 +147,20 @@ DEEPSEEK_MODEL=deepseek-v4-flash,deepseek-v4-pro
 ```
 
 Precedence: CLI args > `config.yml` > `.env` > defaults. Run `node proxy.mjs --help` for the full flag list.
+
+## Inspecting payloads
+
+Pass `--debug` (or `debug: true` in `config.yml`) to have the proxy append one JSON line per request to `/tmp/deepseek-proxy-payloads.jsonl` — method, path, status, latency, and routing shape (`model`, `tools`, `stream`, `max_tokens`, `effort`, `thinking`). Message content and auth headers are never logged.
+
+```bash
+node proxy.mjs --fallback --debug
+```
+
+Use it to confirm Claude Code is actually requesting `/v1/models`, which display id it sends, and what reaches DeepSeek:
+
+```bash
+tail -f /tmp/deepseek-proxy-payloads.jsonl
+```
 
 ## Security
 

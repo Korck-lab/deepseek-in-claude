@@ -35,13 +35,14 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FALLBACK_STATUS = new Set([404, 429, 500, 501, 502, 503, 504]);
 
 function parseArgs(argv) {
-  const out = { port: null, redir: false, fallback: null, config: null, help: false };
+  const out = { port: null, redir: false, fallback: null, config: null, debug: false, help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--port") out.port = Number(argv[++i]);
     else if (a === "--redir") out.redir = true;
     else if (a === "--fallback") out.fallback = true;
     else if (a === "--config") out.config = argv[++i];
+    else if (a === "--debug") out.debug = true;
     else if (a === "--help" || a === "-h") out.help = true;
   }
   return out;
@@ -84,6 +85,7 @@ Usage: node proxy.mjs [options]
   --fallback        on upstream failure retry the other way — DeepSeek <-> Anthropic,
                     same redir relation, both directions
   --config PATH     YAML config file (default ./config.yml)
+  --debug           log every request/response to /tmp/deepseek-proxy-payloads.jsonl
   --help            show this help
 
 Config precedence: CLI args > config.yml > .env > defaults.`);
@@ -100,6 +102,50 @@ try {
 
 const PORT = ARGS.port ?? CFG.port ?? Number(process.env.PORT ?? 8016);
 const UPSTREAM = "api.anthropic.com";
+
+// ---------------------------------------------------------------------------
+// Payload debug log — `--debug` writes one JSON line per request/response so the
+// exact payloads Claude Code sends and the proxy returns can be inspected.
+// ---------------------------------------------------------------------------
+
+const DEBUG = ARGS.debug || Boolean(CFG.debug);
+const DEBUG_LOG = "/tmp/deepseek-proxy-payloads.jsonl";
+let debugStream = null;
+if (DEBUG) {
+  try {
+    debugStream = fs.createWriteStream(DEBUG_LOG, { flags: "a" });
+  } catch {
+    debugStream = null;
+  }
+}
+
+function debugLog(entry) {
+  if (!debugStream) return;
+  try {
+    debugStream.write(JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n");
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Summarize a request body: method, model, first tool name, byte size. Never
+ * logs message content or auth headers — only routing-relevant shape. */
+function summarizeBody(body, reqHeaders) {
+  const out = { bytes: body.length };
+  try {
+    const j = JSON.parse(body.toString("utf8"));
+    if (j.model) out.model = j.model;
+    if (Array.isArray(j.tools) && j.tools.length) out.tools = j.tools.map((t) => t?.name ?? t?.type).filter(Boolean).slice(0, 5);
+    if (j.stream !== undefined) out.stream = j.stream;
+    if (j.max_tokens) out.max_tokens = j.max_tokens;
+    if (j.output_config?.effort) out.effort = j.output_config.effort;
+    if (j.thinking?.type) out.thinking = j.thinking.type;
+  } catch {
+    /* non-JSON body */
+  }
+  if (reqHeaders?.["anthropic-version"]) out.anthropicVersion = reqHeaders["anthropic-version"];
+  return out;
+}
 
 const normalizeModel = (id) => {
   const s = String(id);
@@ -240,10 +286,34 @@ function sendError(res, status, type, message) {
 
 const MODEL_CACHE_TTL = 10 * 60 * 1000;
 let dsModelsCache = { at: 0, models: null };
+
+// Real DeepSeek model ids this proxy will route to upstream.
 let deepseekIds = new Set(DEFAULT_MODELS);
+// Display id -> real id. Claude Code's gateway model discovery drops any model
+// whose id fails /(claude|anthropic)/i, so we serve DeepSeek models under a
+// `claude-deepseek-*` display id and rewrite it back to the real id on request.
+const DISPLAY_PREFIX = "claude-deepseek-";
+let displayToReal = new Map();
+
+function displayIdOf(id) {
+  return `${DISPLAY_PREFIX}${String(id).replace(/^deepseek-/, "")}`;
+}
+
+function displayNameOf(id) {
+  const pretty = String(id)
+    .replace(/^deepseek-/, "")
+    .replace(/-/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+  return `DeepSeek ${pretty}`;
+}
 
 function toModelEntry(id, created) {
-  return { id, display_name: `DeepSeek ${id}`, created_at: created || Math.floor(Date.now() / 1000), type: "model" };
+  return {
+    id: displayIdOf(id),
+    display_name: displayNameOf(id),
+    created_at: created || Math.floor(Date.now() / 1000),
+    type: "model",
+  };
 }
 
 async function deepseekModelList() {
@@ -263,25 +333,38 @@ async function deepseekModelList() {
     }
   }
   const list = [...models.values()];
+  deepseekIds = new Set(models.keys());
+  displayToReal = new Map([...models.keys()].map((id) => [displayIdOf(id), id]));
   dsModelsCache = { at: Date.now(), models: list };
   return list;
 }
 
 async function refreshDeepseekIds() {
   try {
-    deepseekIds = new Set((await deepseekModelList()).map((m) => m.id));
+    await deepseekModelList();
   } catch {
     /* keep fallback */
   }
 }
 refreshDeepseekIds();
 
-const isDeepSeekModel = (id) => deepseekIds.has(id);
+/** Real DeepSeek id for a request model id, or null if not a DeepSeek model.
+ * Accepts both the display id (`claude-deepseek-v4-flash`) and the real id. */
+const deepseekRealId = (id) => {
+  if (deepseekIds.has(id)) return id;
+  return displayToReal.get(id) ?? null;
+};
 
-/** Claude Code effort levels: low, medium, high, xhigh, max. DeepSeek
- * documents low/medium/high/max only — fold xhigh into max so effort is
- * actually honored instead of silently ignored upstream. */
-const EFFORT_MAP = { xhigh: "max" };
+/** Claude Code / Opus 5 effort levels: low, medium, high, xhigh, max. DeepSeek
+ * V4 documents low/high/max only — medium and xhigh don't exist upstream, so
+ * bridge them to the nearest supported level instead of letting the API
+ * silently ignore the request. Overridable per level via `effort:` in
+ * config.yml (merged over these defaults). */
+const EFFORT_DEFAULT = { medium: "high", xhigh: "max" };
+const EFFORT_MAP =
+  CFG.effort && typeof CFG.effort === "object"
+    ? { ...EFFORT_DEFAULT, ...Object.fromEntries(Object.entries(CFG.effort)) }
+    : { ...EFFORT_DEFAULT };
 
 // ---------------------------------------------------------------------------
 // DeepSeek routing — transparent passthrough to the Anthropic-compatible API
@@ -299,7 +382,11 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
   try {
     const reqJson = JSON.parse(body.toString("utf8"));
     let changed = false;
-    if (redir && reqJson.model !== redir.mapped) {
+    const real = reqJson?.model ? deepseekRealId(reqJson.model) : null;
+    if (real && reqJson.model !== real) {
+      reqJson.model = real;
+      changed = true;
+    } else if (redir && reqJson.model !== redir.mapped) {
       reqJson.model = redir.mapped;
       changed = true;
     }
@@ -380,7 +467,6 @@ async function serveModels(req, res) {
   });
 
   const ds = await deepseekModelList();
-  deepseekIds = new Set(ds.map((m) => m.id));
 
   // Never brick the harness on an Anthropic hiccup — serve DeepSeek models only.
 
@@ -452,6 +538,12 @@ function handle(req, res) {
   req.on("data", (c) => chunks.push(c));
   req.on("end", async () => {
     const body = Buffer.concat(chunks);
+    const started = Date.now();
+    res.on("finish", () => {
+      if (DEBUG) {
+        debugLog({ method: req.method, path: reqPath, status: res.statusCode, ms: Date.now() - started, ...summarizeBody(body, req.headers) });
+      }
+    });
     try {
       if (req.method === "GET" && reqPath.startsWith("/v1/models")) {
         await serveModels(req, res);
@@ -461,7 +553,7 @@ function handle(req, res) {
       if (body.length > 0) {
         try { model = JSON.parse(body.toString("utf8"))?.model ?? null; } catch { /* not JSON */ }
       }
-      if (model && isDeepSeekModel(model)) {
+      if (model && deepseekRealId(model)) {
         handleDeepSeek(req, res, body, reqPath, null);
         return;
       }

@@ -143,10 +143,26 @@ if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8004 --
   EF="$(curl -s --max-time 5 -X POST http://localhost:8004/v1/messages -H "content-type: application/json" -d '{"model":"claude-sonnet-4-5","output_config":{"effort":"xhigh"},"messages":[{"role":"user","content":"x"}]}')"
   check "T7b effort xhigh folded to max" 'echo "$EF" | grep -q "EFFORT:max"'
 
+  EFM="$(curl -s --max-time 5 -X POST http://localhost:8004/v1/messages -H "content-type: application/json" -d '{"model":"claude-sonnet-4-5","output_config":{"effort":"medium"},"messages":[{"role":"user","content":"x"}]}')"
+  check "T7d effort medium bridged to high" 'echo "$EFM" | grep -q "EFFORT:high"'
+
   FB="$(curl -s --max-time 5 -X POST http://localhost:8004/v1/messages -H "content-type: application/json" -d '{"model":"claude-fable-1","messages":[{"role":"user","content":"x"}]}')"
   check "T7c fable rewritten to deepseek-v4-pro" 'echo "$FB" | grep -q "ROUTED:deepseek-v4-pro"'
 else
   echo "FAIL T7 could not start proxy with mock upstream"
+fi
+
+# T7e effort map override via config.yml
+cat >"$TMP/effort.yml" <<'EOF'
+port: 8007
+effort:
+  medium: low
+EOF
+if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8007 --port 8007 --config "$TMP/effort.yml"; then
+  EFM="$(curl -s --max-time 5 -X POST http://localhost:8007/v1/messages -H "content-type: application/json" -d '{"model":"deepseek-v4-flash","output_config":{"effort":"medium"},"messages":[{"role":"user","content":"x"}]}')"
+  check "T7e effort override medium->low via config" 'echo "$EFM" | grep -q "EFFORT:low"'
+else
+  echo "FAIL T7e could not start proxy with effort config"
 fi
 
 # T8 forward fallback: dead deepseek -> real anthropic
