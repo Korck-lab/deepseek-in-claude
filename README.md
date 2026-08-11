@@ -39,9 +39,16 @@ Then start Claude Code and pick a model with `/model`.
 
 ## Quickstart
 
-One command installs the proxy into `~/.deepseek-in-claude` (override with `DEEPSEEK_IN_CLAUDE_HOME`). A fresh install prompts for your API key — it opens the [key page](https://platform.deepseek.com/api_keys) and reads a hidden paste. Updates keep your existing `.env` untouched:
+One command installs the proxy into `~/.deepseek-in-claude`. A fresh install prompts for your API key — it opens the [key page](https://platform.deepseek.com/api_keys) and reads a hidden paste. Updates keep your existing `.env` untouched:
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/Korck-lab/deepseek-in-claude/main/scripts/install.sh | bash
+```
+
+Install somewhere else with `DEEPSEEK_IN_CLAUDE_HOME` — use an absolute path and `export` it first, or the variable won't reach the installer:
+
+```bash
+export DEEPSEEK_IN_CLAUDE_HOME="$HOME/.deepseek-in-claude"
 curl -fsSL https://raw.githubusercontent.com/Korck-lab/deepseek-in-claude/main/scripts/install.sh | bash
 ```
 
