@@ -1,0 +1,20 @@
+# deepseek-in-claude proxy config
+# Loaded from ./config.yml by default; override with --config PATH.
+# CLI args win over this file. Keys are optional — omitting falls back to defaults.
+
+# Listen port (default 8016).
+port: 8016
+
+# Redirect Anthropic family models to DeepSeek counterparts.
+# `--redir` enables it; this block overrides the built-in map:
+#   haiku/sonnet/opus -> deepseek-v4-flash, fable -> deepseek-v4-pro
+redir:
+  haiku: deepseek-v4-flash
+  sonnet: deepseek-v4-flash
+  opus: deepseek-v4-flash
+  fable: deepseek-v4-pro
+
+# Bidirectional fallback: if the routed upstream fails (error/timeout/404/429/5xx),
+# retry the other way using the same redir relation — DeepSeek <-> Anthropic.
+# Implied by `--redir`; set false to disable.
+fallback: true

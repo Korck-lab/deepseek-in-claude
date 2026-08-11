@@ -29,7 +29,7 @@ node proxy.mjs
 Then point Claude Code at it and pick a DeepSeek model with `/model`:
 
 ```bash
-ANTHROPIC_BASE_URL=http://localhost:8787 claude
+ANTHROPIC_BASE_URL=http://localhost:8016 claude
 ```
 
 Anthropic traffic still works — it passes through untouched with your normal auth.
@@ -62,7 +62,7 @@ All variables come from `.env` or real env vars (real vars win). Only the key is
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek API base URL. |
 | `DEEPSEEK_MODEL` | `deepseek-v4-pro,deepseek-v4-flash` | Comma-separated model fallbacks shown in the picker. |
 | `DEEPSEEK_ANTHROPIC_BASE_URL` | `$DEEPSEEK_BASE_URL/anthropic` | DeepSeek's Anthropic-compatible endpoint. |
-| `PORT` | `8787` | Proxy listen port. |
+| `PORT` | `8016` | Proxy listen port. |
 
 Example:
 
@@ -80,10 +80,34 @@ node proxy.mjs
 then
 
 ```bash
-ANTHROPIC_BASE_URL=http://localhost:8787 claude
+ANTHROPIC_BASE_URL=http://localhost:8016 claude
 ```
 
 Select a DeepSeek model with `/model` (e.g. `deepseek-v4-flash`). Everything else behaves like a normal Claude Code session — your Anthropic models and auth are unaffected.
+
+## Redirect & fallback
+
+`--redir` routes Anthropic family models to DeepSeek counterparts, so Claude Code's default models keep working without switching: `haiku`/`sonnet`/`opus` → `deepseek-v4-flash`, `fable` → `deepseek-v4-pro`.
+
+`--fallback` retries the other way when the routed upstream fails (error, timeout, `404`/`429`/`5xx`): a redirected `sonnet` call that DeepSeek fails falls back to real Anthropic `sonnet` — and a direct Anthropic call that fails falls back to its DeepSeek counterpart. Same relation map, both directions, one retry.
+
+```bash
+node proxy.mjs --redir --fallback
+```
+
+All of it can be configured in a local YAML file instead (`config.yml`, override with `--config`), so `--redir` becomes just the toggle:
+
+```yaml
+port: 8016
+redir:
+  haiku: deepseek-v4-flash
+  sonnet: deepseek-v4-flash
+  opus: deepseek-v4-flash
+  fable: deepseek-v4-pro
+fallback: true
+```
+
+Precedence: CLI args > `config.yml` > `.env` > defaults. Run `node proxy.mjs --help` for the full flag list.
 
 ## Auto-versioning
 
@@ -108,9 +132,10 @@ The `post-commit` hook reads the real message from `COMMIT_EDITMSG`, bumps `VERS
 
 ```bash
 node --check proxy.mjs   # syntax check
+bash scripts/test.sh     # feature smoke tests (real claude -p calls + mock upstream)
 ```
 
-Requires Node.js >= 18.
+Requires Node.js >= 18. `scripts/test.sh` needs the `claude` CLI and a real `DEEPSEEK_API_KEY` — it makes a handful of tiny real API calls across the config matrix (default, `--port`, `--redir`, `--fallback`, YAML config).
 
 ## Security
 

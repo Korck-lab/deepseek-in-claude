@@ -101,4 +101,4 @@ fi
 
 echo "==> done"
 echo "    start:   node $DEST/proxy.mjs"
-echo "    connect: ANTHROPIC_BASE_URL=http://localhost:8787 claude"
+echo "    connect: ANTHROPIC_BASE_URL=http://localhost:8016 claude"
