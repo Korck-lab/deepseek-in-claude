@@ -63,12 +63,18 @@ http.createServer((req, res) => {
   const chunks = [];
   req.on("data", (c) => chunks.push(c));
   req.on("end", () => {
-    let model = "?", effort = "?";
+    let model = "?", effort = "?", advisor = false;
     try {
       const j = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       model = j.model ?? "?";
       effort = j.output_config?.effort ?? "?";
+      advisor = Array.isArray(j.tools) && j.tools.some((t) => /^advisor_/.test(t.type ?? ""));
     } catch {}
+    if (advisor) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Failed to deserialize the JSON body into the target type: tools[249]: unknown variant `advisor_20260301`, expected `web_search_20250305` or `web_search_20260209` at line 1 column 393737", type: "invalid_request_error", param: null, code: "invalid_request_error" } }));
+      return;
+    }
     const text = `ROUTED:${model} EFFORT:${effort}`;
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.end(
@@ -141,10 +147,10 @@ if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8004 --
   check "T7 redir sonnet rewritten to deepseek-v4-flash" 'echo "$O" | grep -q "ROUTED:deepseek-v4-flash"'
 
   EF="$(curl -s --max-time 5 -X POST http://localhost:8004/v1/messages -H "content-type: application/json" -d '{"model":"claude-sonnet-4-5","output_config":{"effort":"xhigh"},"messages":[{"role":"user","content":"x"}]}')"
-  check "T7b effort xhigh folded to max" 'echo "$EF" | grep -q "EFFORT:max"'
+  check "T7b effort xhigh passes through" 'echo "$EF" | grep -q "EFFORT:xhigh"'
 
   EFM="$(curl -s --max-time 5 -X POST http://localhost:8004/v1/messages -H "content-type: application/json" -d '{"model":"claude-sonnet-4-5","output_config":{"effort":"medium"},"messages":[{"role":"user","content":"x"}]}')"
-  check "T7d effort medium bridged to high" 'echo "$EFM" | grep -q "EFFORT:high"'
+  check "T7d effort medium passes through" 'echo "$EFM" | grep -q "EFFORT:medium"'
 
   FB="$(curl -s --max-time 5 -X POST http://localhost:8004/v1/messages -H "content-type: application/json" -d '{"model":"claude-fable-1","messages":[{"role":"user","content":"x"}]}')"
   check "T7c fable rewritten to deepseek-v4-pro" 'echo "$FB" | grep -q "ROUTED:deepseek-v4-pro"'
@@ -165,6 +171,14 @@ else
   echo "FAIL T7e could not start proxy with effort config"
 fi
 
+# T10 advisor_ tool dropped before forwarding (mock 400 retry path)
+if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8008 --port 8008 --redir; then
+  AD="$(curl -s --max-time 5 -X POST http://localhost:8008/v1/messages -H "content-type: application/json" -d '{"model":"claude-sonnet-4-5","tools":[{"type":"advisor_20260301","name":"advisor"}],"messages":[{"role":"user","content":"x"}]}')"
+  check "T10 advisor tool dropped, request reaches mock" 'echo "$AD" | grep -q "ROUTED:"'
+else
+  echo "FAIL T10 could not start proxy on 8008"
+fi
+
 # T8 forward fallback: dead deepseek -> real anthropic
 if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:1" start_proxy 8005 --port 8005 --redir --fallback; then
   O="$(cc 8005 --model sonnet "Reply with exactly: OK")"
@@ -180,6 +194,9 @@ if start_proxy 8006 --port 8006 --fallback; then
 else
   echo "FAIL T9 could not start proxy"
 fi
+
+# T11 per-request usage log line (written after real proxy runs above)
+check "T11 usage log written" 'test -s "$ROOT/logs/proxy-usage.jsonl" && grep -q "usage" "$ROOT/logs/proxy-usage.jsonl"'
 
 # ---------------------------------------------------------------------------
 echo ""

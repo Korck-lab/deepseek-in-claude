@@ -360,11 +360,49 @@ const deepseekRealId = (id) => {
  * bridge them to the nearest supported level instead of letting the API
  * silently ignore the request. Overridable per level via `effort:` in
  * config.yml (merged over these defaults). */
-const EFFORT_DEFAULT = { medium: "high", xhigh: "max" };
+const EFFORT_DEFAULT = {};
 const EFFORT_MAP =
   CFG.effort && typeof CFG.effort === "object"
     ? { ...EFFORT_DEFAULT, ...Object.fromEntries(Object.entries(CFG.effort)) }
     : { ...EFFORT_DEFAULT };
+
+// ---------------------------------------------------------------------------
+// Usage log — one JSON line per DeepSeek request, always on (not DEBUG-gated)
+// ---------------------------------------------------------------------------
+
+const USAGE_LOG = path.join(HERE, "logs", "proxy-usage.jsonl");
+let usageStream = null;
+try {
+  fs.mkdirSync(path.dirname(USAGE_LOG), { recursive: true });
+  usageStream = fs.createWriteStream(USAGE_LOG, { flags: "a" });
+} catch {
+  usageStream = null;
+}
+
+function logUsage(entry) {
+  if (!usageStream) return;
+  try {
+    usageStream.write(JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n");
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Pull usage out of streamed SSE: message_start usage + message_delta usage. */
+function decodeSse(raw) {
+  const events = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const m = line.match(/^data:\s?(.*)$/);
+    if (!m || m[1] === "[DONE]" || m[1].trim() === "") continue;
+    try { events.push(JSON.parse(m[1])); } catch { /* skip */ }
+  }
+  let usage = null;
+  for (const ev of events) {
+    if (ev.type === "message_start" && ev.message?.usage) usage = { ...(usage ?? {}), ...ev.message.usage };
+    else if (ev.type === "message_delta" && ev.usage) usage = { ...(usage ?? {}), ...ev.usage };
+  }
+  return usage;
+}
 
 // ---------------------------------------------------------------------------
 // DeepSeek routing — transparent passthrough to the Anthropic-compatible API
@@ -394,6 +432,13 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
       reqJson.output_config.effort = EFFORT_MAP[reqJson.output_config.effort];
       changed = true;
     }
+    if (Array.isArray(reqJson?.tools)) {
+      const kept = reqJson.tools.filter((t) => !(t && typeof t.type === "string" && /^advisor_/.test(t.type)));
+      if (kept.length !== reqJson.tools.length) {
+        reqJson.tools = kept;
+        changed = true;
+      }
+    }
     if (changed) forwardedBody = Buffer.from(JSON.stringify(reqJson));
   } catch {
     /* leave body untouched */
@@ -413,31 +458,71 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
   }
 
   const lib = u.protocol === "https:" ? https : http;
-  const upstream = lib.request(
-    { hostname: u.hostname, port: u.port || (u.protocol === "https:" ? 443 : 80), path: u.pathname + u.search, method: req.method ?? "POST", headers },
-    (up) => {
-      const status = up.statusCode ?? 502;
-      if (FALLBACK && redir && FALLBACK_STATUS.has(status)) {
-        up.resume(); // drain so the socket frees
-        forwardToAnthropic(req, res, reqPath, body, null); // original model + body
+  const started = Date.now();
+  let sentModel = null;
+  try { sentModel = JSON.parse(forwardedBody.toString("utf8"))?.model ?? null; } catch { /* non-JSON */ }
+
+  function issueUpstream(attempts) {
+    const upstream = lib.request(
+      { hostname: u.hostname, port: u.port || (u.protocol === "https:" ? 443 : 80), path: u.pathname + u.search, method: req.method ?? "POST", headers },
+      (up) => {
+        const status = up.statusCode ?? 502;
+        if (FALLBACK && redir && FALLBACK_STATUS.has(status)) {
+          up.resume(); // drain so the socket frees
+          forwardToAnthropic(req, res, reqPath, body, null); // original model + body
+          return;
+        }
+        if (status === 200) {
+          res.writeHead(status, cleanResponseHeaders(up.headers));
+          const respChunks = [];
+          up.on("data", (c) => { respChunks.push(c); res.write(c); });
+          up.on("end", () => {
+            res.end();
+            logUsage({ method: req.method, path: reqPath, status, ms: Date.now() - started, model: sentModel, usage: decodeSse(Buffer.concat(respChunks).toString("utf8")) });
+          });
+          return;
+        }
+        const chunks = [];
+        up.on("data", (c) => chunks.push(c));
+        up.on("end", () => {
+          const raw = Buffer.concat(chunks).toString("utf8");
+          const m = status === 400 && raw.includes("unknown variant") ? raw.match(/tools\[(\d+)\]/) : null;
+          if (m && attempts < 3) {
+            const idx = Number(m[1]);
+            try {
+              const j = JSON.parse(forwardedBody.toString("utf8"));
+              if (Array.isArray(j.tools) && j.tools[idx]) {
+                j.tools.splice(idx, 1);
+                forwardedBody = Buffer.from(JSON.stringify(j));
+                issueUpstream(attempts + 1);
+                return;
+              }
+            } catch {
+              /* fall through to error forward */
+            }
+          }
+          res.writeHead(status, cleanResponseHeaders(up.headers));
+          res.end(raw);
+          logUsage({ method: req.method, path: reqPath, status, ms: Date.now() - started, model: sentModel, usage: null });
+        });
+      }
+    );
+    upstream.setTimeout(60000, () => upstream.destroy(new Error("upstream timeout")));
+    upstream.on("error", (err) => {
+      if (res.headersSent) { res.destroy(); return; }
+      if (FALLBACK && redir) {
+        forwardToAnthropic(req, res, reqPath, body, null);
         return;
       }
-      res.writeHead(status, cleanResponseHeaders(up.headers));
-      up.on("data", (c) => res.write(c));
-      up.on("end", () => res.end());
+      sendError(res, 502, "api_error", `deepseek upstream error: ${err.message}`);
+    });
+    if (forwardedBody.length > 0) {
+      headers["content-length"] = String(forwardedBody.length);
+      upstream.write(forwardedBody);
     }
-  );
-  upstream.setTimeout(60000, () => upstream.destroy(new Error("upstream timeout")));
-  upstream.on("error", (err) => {
-    if (res.headersSent) { res.destroy(); return; }
-    if (FALLBACK && redir) {
-      forwardToAnthropic(req, res, reqPath, body, null);
-      return;
-    }
-    sendError(res, 502, "api_error", `deepseek upstream error: ${err.message}`);
-  });
-  if (forwardedBody.length > 0) upstream.write(forwardedBody);
-  upstream.end();
+    upstream.end();
+  }
+  issueUpstream(1);
 }
 
 // ---------------------------------------------------------------------------
