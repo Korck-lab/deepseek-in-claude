@@ -85,6 +85,20 @@ ANTHROPIC_AUTH_TOKEN=local-deepseek-proxy \
 ANTHROPIC_BASE_URL=http://localhost:8016 claude
 ```
 
+### The `claudei.sh` launcher
+
+`claudei.sh` is a convenience launcher: it updates the `claude` CLI, starts the proxy on `:8016` (reusing it if already running), and boots Claude Code with gateway discovery enabled plus the DeepSeek V4 1M context window, so the status-line context percentage reflects the real window instead of Claude Code's 200k fallback for unknown models.
+
+The `claude` invocation is plain and easy to customize — edit the launch line to suit your setup. Common tweaks:
+
+- `--dangerously-skip-permissions` — skip permission prompts (an off switch you may want removed).
+- `--autocompact N` — context compaction threshold in tokens.
+- `--append-system-prompt "..."` — extra instructions injected on every session.
+- `--model <id>` — start on a specific model instead of the last-used default.
+- `CLAUDE_CODE_MAX_CONTEXT_TOKENS` — override the context window if you point the proxy at a different model family.
+
+Any Claude Code flag or env var applies there. If you prefer not to use it, the three-command form above does the same job.
+
 ## How it works
 
 Claude Code speaks Anthropic SSE. The proxy:
