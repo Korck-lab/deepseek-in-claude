@@ -463,8 +463,11 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
   try { sentModel = JSON.parse(forwardedBody.toString("utf8"))?.model ?? null; } catch { /* non-JSON */ }
 
   function issueUpstream(attempts) {
+    // Fresh complete headers per attempt, built BEFORE request() — mutating a
+    // shared headers object after request creation loses retry writes (Node 26).
+    const attemptHeaders = { ...headers, "content-length": String(forwardedBody.length) };
     const upstream = lib.request(
-      { hostname: u.hostname, port: u.port || (u.protocol === "https:" ? 443 : 80), path: u.pathname + u.search, method: req.method ?? "POST", headers },
+      { hostname: u.hostname, port: u.port || (u.protocol === "https:" ? 443 : 80), path: u.pathname + u.search, method: req.method ?? "POST", headers: attemptHeaders, ...(attempts > 1 ? { agent: false } : {}) },
       (up) => {
         const status = up.statusCode ?? 502;
         if (FALLBACK && redir && FALLBACK_STATUS.has(status)) {
@@ -516,10 +519,7 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
       }
       sendError(res, 502, "api_error", `deepseek upstream error: ${err.message}`);
     });
-    if (forwardedBody.length > 0) {
-      headers["content-length"] = String(forwardedBody.length);
-      upstream.write(forwardedBody);
-    }
+    if (forwardedBody.length > 0) upstream.write(forwardedBody);
     upstream.end();
   }
   issueUpstream(1);
