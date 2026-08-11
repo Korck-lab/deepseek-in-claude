@@ -1,6 +1,5 @@
 logs/
 .env
-claudei.sh
 config.yml
 
 .DS_Store
