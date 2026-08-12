@@ -68,3 +68,35 @@ topology section of `CONTEXT.md`.
 
 **Patching the CLI's model catalog** — brittle across upgrades and outside this project's
 zero-dependency, no-build-step constraint.
+
+## Update — 2026-08-12: the constraints are documented, and the filter loosened
+
+Two corrections to the Context above. The decision stands; its stated reasons were partly
+wrong.
+
+**"Neither is documented" is false.** Both behaviors are specified:
+<https://code.claude.com/docs/en/llm-gateway-protocol#model-discovery> and
+<https://code.claude.com/docs/en/model-config#correct-the-window-for-a-gateway-or-custom-model-id>.
+They were established empirically here only because the documentation was not found first.
+Read it before inferring CLI behavior from the decompiled binary.
+
+**The filter is `contains`, not `startsWith`.** Since CLI 2.1.223 an entry is kept when its
+id contains `claude` or `anthropic` anywhere, case-insensitively; before that it had to
+begin with one. Provider-prefixed ids such as `vertex_ai/claude-sonnet-4-6` now pass.
+
+That change matters because the "Alternatives rejected" entry above —
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` being "ignored for `claude-*` ids, which discovery forces"
+— is no longer true in its second half. Discovery no longer forces a `claude-` *prefix*, so
+an id shaped `deepseek/claude-deepseek-chat` would satisfy the filter while leaving
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` applicable, with proactive compaction intact at a declared
+window. That is the correct shape for any served model whose real window is not 1M.
+
+It is not adopted here because both DeepSeek V4 models genuinely have a 1M context window,
+so `[1m]` states the truth rather than working around a default, and renaming ids would
+break every pinned model string in existing configs. Revisit this if a served model ever has
+a smaller window — and note that `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is one value per session,
+so declaring DeepSeek's window would misdeclare the Anthropic models alongside it.
+
+Related: [ADR-0003](0003-launcher-seeds-the-model-cache.md) — the ids in this ADR now reach
+the picker through a seeded cache rather than a discovery fetch. The filter still applies:
+it is the same reader-side code path.

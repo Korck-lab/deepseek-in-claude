@@ -149,6 +149,9 @@ a long-lived secret on disk, and still not the user's plan.
 
 ## Update — 2026-08-12: the sentinel is no longer the default path
 
+*The mechanism that replaced it is [ADR-0003](0003-launcher-seeds-the-model-cache.md); this
+section records only what changes for the invariant here.*
+
 The invariant is unchanged and this update strengthens it: the default launch now sets **no
 Anthropic auth environment variable at all**.
 

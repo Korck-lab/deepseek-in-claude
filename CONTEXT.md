@@ -27,8 +27,16 @@ see ADR-0001.
 keeps a `displayToReal` map and rewrites before forwarding.
 
 **Gateway model discovery** — the Claude Code feature (enabled by
-`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`) that calls `GET /v1/models` on the base
-URL and populates the `/model` picker. Only runs when an auth env var is set.
+`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`) that populates the `/model` picker with
+gateway models. Two halves, and the distinction matters: the *fetch* calls
+`GET /v1/models` on the base URL and runs only when an auth env var is set, while the
+*reader* — what the picker actually lists from — reads
+`~/.claude/cache/gateway-models.json` and needs no credential. Say which half.
+
+**Seeded model cache** — `~/.claude/cache/gateway-models.json`, written by `claudei.sh`
+from the proxy's `/_proxy/deepseek-models` rather than fetched by the CLI. This is why the
+launcher sets no auth env var and claude.ai connectors keep working; its `baseUrl` must
+match `ANTHROPIC_BASE_URL` byte for byte. See ADR-0003.
 
 **Credential bridge** — the substitution of the caller's sentinel
 `ANTHROPIC_AUTH_TOKEN` for the user's real Claude Code OAuth token on the Anthropic leg.
@@ -40,8 +48,10 @@ enforced on both sides now: `claudei.sh` unsets `ANTHROPIC_API_KEY` and
 client-supplied `x-api-key` on the Anthropic leg, because Anthropic prefers that header
 over the bearer. See ADR-0002 and its guard suite, `scripts/test-auth-bridge.sh`.
 
-**Sentinel** — the placeholder auth value Claude Code is given. Random per install, stored as `sentinel:` in `config.yml` (the single source of truth for both the proxy and `claudei.sh`); falls back to `local-deepseek-proxy` when that file is absent.
-It is not a credential and never leaves the proxy.
+**Sentinel** — the placeholder auth value Claude Code *can* be given. Random per install, stored as `sentinel:` in `config.yml`; falls back to `local-deepseek-proxy` when that file is absent.
+It is not a credential and never leaves the proxy. Since v0.7.0 `claudei.sh` no longer sets
+it — the seeded model cache removed the reason to — so it is now the opt-in path for
+someone setting `ANTHROPIC_AUTH_TOKEN` deliberately, not the default one.
 
 **Redir** — the `--redir` mode that routes Anthropic-family model names
 (haiku/sonnet/opus/fable) to DeepSeek via a mapping. Distinct from *fallback*.
@@ -110,10 +120,12 @@ invokes itself — `test-parsing`, `test-model-race`, `test-auth-bridge` — wit
 `test-fallback-race` gated behind `RUN_SLOW_TESTS=1` because it spends real API traffic.
 Most cases need no network. Counting cases here has gone stale repeatedly; run the suite for
 the number. `T2c` and `T13` cover the display-id contract from ADR-0001;
-`scripts/test-auth-bridge.sh` is the guard for ADR-0002 — half of it slices
+`scripts/test-auth-bridge.sh` guards ADR-0002 *and* ADR-0003 — half of it slices
 `forwardHeaders` + `applyAnthropicAuth` out of `proxy.mjs` to assert no `x-api-key` reaches
-the Anthropic leg, half drives `claudei.sh` against a stub CLI that dumps its environment.
-Both ADRs' guards must not be deleted as redundant.
+the Anthropic leg (`A1`–`A6`, ADR-0002), half drives `claudei.sh` against a stub CLI that
+dumps its environment (`L1`–`L5`; `L2` asserts the CLI receives *no* auth variable and
+`L4`/`L5` that the model cache is seeded and keyed to the exact base URL, ADR-0003).
+These guards must not be deleted as redundant.
 
 `scripts/observe.mjs` sniffs live traffic; `scripts/probe.mjs` runs a `claude -p` matrix
 across models and effort levels. Findings from the last full run are in
