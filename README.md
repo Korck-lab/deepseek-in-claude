@@ -99,14 +99,20 @@ ANTHROPIC_BASE_URL=http://localhost:8016 claude --model 'claude-deepseek-v4-flas
 
 `claudei.sh` is a convenience launcher: it updates the `claude` CLI, starts the proxy on `:8016` (reusing it if already running), and boots Claude Code with gateway discovery enabled.
 
+It stops the proxy again on the way out — including after Ctrl+C — and refuses to signal anything on the port that is not actually its own proxy, so a port inherited by some other process is left alone.
+
 The `claude` invocation is plain and easy to customize — edit the launch line to suit your setup. Common tweaks:
 
-- `--dangerously-skip-permissions` — skip permission prompts (an off switch you may want removed).
+- `--dangerously-skip-permissions` — skip permission prompts. On by default (that is the `i` in `claudei`); turn it off for a session with `CLAUDEI_SKIP_PERMISSIONS=0 ./claudei.sh`.
 - `--autocompact N` — compaction threshold in tokens. Note that it also *caps* the reported context window: passing `--autocompact 350k` makes a 1M-window model report 350k. The launcher no longer sets it.
 - `--append-system-prompt "..."` — extra instructions injected on every session.
 - `--model <id>` — start on a specific model instead of the last-used default.
 
 Any Claude Code flag or env var applies there. If you prefer not to use it, the three-command form above does the same job.
+
+A few environment variables steer the launcher itself: `DEEPSEEK_IN_CLAUDE_HOME` (checkout location), `DEEPSEEK_PROXY_PORT` (listen port), `CLAUDE` (path to the CLI), and `CLAUDEI_SKIP_PERMISSIONS`. Its pid file, launch fingerprint and proxy log live together in a per-user `$TMPDIR/deepseek-in-claude-$UID` directory created mode `0700`.
+
+`--fallback` is passed only when `config.yml` says nothing about `fallback:` — CLI flags win over the config file inside the proxy, so passing it unconditionally would override an explicit `fallback: false`.
 
 Three env vars earlier versions of this launcher set have been dropped — they were measured against Claude Code 2.1.228 and do not do what their names suggest:
 

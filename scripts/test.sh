@@ -34,9 +34,14 @@ start_proxy() { # start_proxy WAIT_PORT [node args...]
   local p="$1"; shift
   node "$ROOT/proxy.mjs" "$@" >/dev/null 2>&1 &
   PIDS+=("$!")
-  for _ in $(seq 1 60); do
+  # Counted loop rather than `seq`, which is not POSIX and is absent on some
+  # systems — its failure here would collapse the wait to zero attempts and
+  # report every test as "could not start proxy".
+  local i=0
+  while [ "$i" -lt 60 ]; do
     curl -s -o /dev/null --max-time 2 "http://localhost:$p/v1/models" 2>/dev/null && return 0
     sleep 0.2
+    i=$((i + 1))
   done
   return 1
 }
@@ -97,6 +102,29 @@ EOF
 node "$MOCK" &
 PIDS+=("$!")
 sleep 0.3
+
+# --- pre-flight --------------------------------------------------------------
+# Every one of these surfaces as a confusing test failure rather than as itself:
+# a missing claude CLI reads as "the proxy is broken", and a missing key makes
+# every DeepSeek route return an auth error that looks like a routing bug.
+preflight_failed=0
+need() { # need NAME COMMAND
+  command -v "$2" >/dev/null 2>&1 || { echo "error: $1 not found ($2)" >&2; preflight_failed=1; }
+}
+need "Node.js >= 18" node
+need "curl" curl
+if ! command -v "$CLAUDE" >/dev/null 2>&1 && [ ! -x "$CLAUDE" ]; then
+  echo "error: claude CLI not found at '$CLAUDE'. Set CLAUDE=/path/to/claude." >&2
+  preflight_failed=1
+fi
+if ! grep -q '^DEEPSEEK_API_KEY=sk-' "$ROOT/.env" 2>/dev/null && [ -z "${DEEPSEEK_API_KEY:-}" ]; then
+  echo "error: no DEEPSEEK_API_KEY — set it in $ROOT/.env or the environment." >&2
+  preflight_failed=1
+fi
+if [ "$preflight_failed" -ne 0 ]; then
+  echo "==> pre-flight failed; not running tests" >&2
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 echo "==> deepseek-in-claude feature tests"

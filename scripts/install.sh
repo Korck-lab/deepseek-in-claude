@@ -42,6 +42,13 @@ if [ -d "$DEST/.git" ]; then
   MODE="update"
   echo "==> existing checkout, updating..."
   git -C "$DEST" pull --ff-only --quiet origin "$BRANCH"
+elif [ -e "$DEST" ] && [ -n "$(ls -A "$DEST" 2>/dev/null || echo x)" ]; then
+  # git clone into a non-empty directory fails with "destination path already
+  # exists and is not an empty directory", which reads like a git problem rather
+  # than "something else already lives where the checkout goes".
+  echo "error: $DEST already exists and is not a deepseek-in-claude checkout." >&2
+  echo "       Move it aside, or set DEEPSEEK_IN_CLAUDE_HOME to a different path." >&2
+  exit 1
 else
   echo "==> cloning..."
   git clone --quiet --branch "$BRANCH" --depth 1 "https://github.com/$REPO.git" "$DEST"
@@ -83,6 +90,9 @@ elif [ "$TTY_OK" = true ]; then
       break
     fi
     echo ""
+    # Trim surrounding whitespace: a pasted key often carries a trailing space or
+    # CR, and the proxy would send it verbatim and get a puzzling 401.
+    KEY="$(printf '%s' "$KEY" | tr -d '[:space:]')"
     if [ -n "$KEY" ] && [ "${KEY#sk-}" != "$KEY" ]; then
       break
     fi
@@ -90,9 +100,14 @@ elif [ "$TTY_OK" = true ]; then
   done
 
   if [ -n "$KEY" ]; then
-    grep -v '^DEEPSEEK_API_KEY=' "$ENV_FILE" > "$ENV_FILE.tmp" || true
-    mv "$ENV_FILE.tmp" "$ENV_FILE"
-    printf 'DEEPSEEK_API_KEY=%s\n' "$KEY" >> "$ENV_FILE"
+    # Rewrite through a private temp file in the same directory and rename it
+    # into place: the previous read-then-truncate left a window where a second
+    # installer (or a proxy start) could see a .env with no key at all.
+    TMP_ENV="$(mktemp "$DEST/.env.XXXXXX")"
+    chmod 600 "$TMP_ENV"
+    grep -v '^DEEPSEEK_API_KEY=' "$ENV_FILE" > "$TMP_ENV" || true
+    printf 'DEEPSEEK_API_KEY=%s\n' "$KEY" >> "$TMP_ENV"
+    mv "$TMP_ENV" "$ENV_FILE"
     echo "==> DEEPSEEK_API_KEY saved to $ENV_FILE (gitignored)"
   fi
 else

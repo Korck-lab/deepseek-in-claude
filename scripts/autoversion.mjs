@@ -31,7 +31,16 @@ if (/BREAKING CHANGE/i.test(msg) || /^[a-z]+(\(.+\))?!:/.test(subject)) {
 }
 
 function bump(type) {
-  const [major, minor, patch] = readFileSync(versionFile, "utf8").trim().split(".").map(Number);
+  // A VERSION file that is missing, empty, or not three integers would produce
+  // NaN parts and write a literal "NaN.0.0" — which then poisons every later
+  // bump, since the next read parses that back as NaN too.
+  const raw = existsSync(versionFile) ? readFileSync(versionFile, "utf8").trim() : "";
+  const parts = raw.split(".");
+  const [major, minor, patch] = parts.map(Number);
+  if (parts.length !== 3 || ![major, minor, patch].every((n) => Number.isInteger(n) && n >= 0)) {
+    console.error(`autoversion: VERSION is not a valid x.y.z version (${JSON.stringify(raw)}) — not bumping`);
+    process.exit(0);
+  }
   const next =
     type === "major" ? `${major + 1}.0.0`
     : type === "minor" ? `${major}.${minor + 1}.0`
