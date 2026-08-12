@@ -87,8 +87,11 @@ function loadYaml(text) {
       stack[stack.length - 1].obj[key] = next;
       stack.push({ indent, obj: next });
     } else {
+      // Zero-padded values stay strings: `Number("007")` is 7, which would
+      // silently rewrite an id or token that happens to look numeric.
+      const numeric = /^\d+$/.test(val) && !/^0\d/.test(val);
       stack[stack.length - 1].obj[key] =
-        val === "true" ? true : val === "false" ? false : /^\d+$/.test(val) ? Number(val) : val.replace(/^["']|["']$/g, "");
+        val === "true" ? true : val === "false" ? false : numeric ? Number(val) : val.replace(/^["']|["']$/g, "");
     }
   }
   return root;
@@ -189,6 +192,10 @@ if (DEBUG) {
   }
 }
 
+// Concurrent writes are not serialised. A line over the pipe buffer could in
+// principle interleave with another, but --debug is a hand-run diagnostic and a
+// write queue is more machinery than a rare cosmetic tear in a debug log
+// warrants. Deliberately left as is.
 function debugLog(entry) {
   if (!debugStream) return;
   try {
@@ -591,11 +598,30 @@ const DISPLAY_PREFIX = "claude-deepseek-";
 // on us. The suffix is stripped again before the request reaches DeepSeek.
 const DISPLAY_SUFFIX = "[1m]";
 const stripWindowSuffix = (id) => String(id).replace(/\[1m\]$/i, "");
-let displayToReal = new Map();
 
 function displayIdOf(id) {
   return `${DISPLAY_PREFIX}${String(id).replace(/^deepseek-/, "")}${DISPLAY_SUFFIX}`;
 }
+
+/** Both the suffixed display id and its bare form map to the real id — Claude
+ * Code keeps both in play when it resolves a model name. */
+function buildDisplayMap(ids) {
+  return new Map(
+    [...ids].flatMap((id) => {
+      const display = displayIdOf(id);
+      return [
+        [display, id],
+        [stripWindowSuffix(display), id],
+      ];
+    })
+  );
+}
+
+// Seeded from the fallback list rather than left empty until the first fetch
+// lands. Empty, a request arriving during startup could not resolve
+// `claude-deepseek-v4-flash[1m]` — the id the picker actually sends — so it fell
+// through to Anthropic and came back 401/404 instead of routing to DeepSeek.
+let displayToReal = buildDisplayMap(DEFAULT_MODELS);
 
 function displayNameOf(id) {
   const pretty = String(id)
@@ -649,17 +675,7 @@ async function fetchDeepseekModelList() {
   }
   const list = [...models.values()];
   deepseekIds = new Set(models.keys());
-  // Key both the suffixed display id and its bare form — Claude Code keeps both
-  // in play when it resolves a model name.
-  displayToReal = new Map(
-    [...models.keys()].flatMap((id) => {
-      const display = displayIdOf(id);
-      return [
-        [display, id],
-        [stripWindowSuffix(display), id],
-      ];
-    })
-  );
+  displayToReal = buildDisplayMap(models.keys());
   dsModelsCache = { at: Date.now(), models: list };
   return list;
 }
@@ -687,10 +703,10 @@ const deepseekRealId = (id) => {
 };
 
 /** Claude Code / Opus 5 effort levels: low, medium, high, xhigh, max. DeepSeek
- * V4 documents low/high/max only — medium and xhigh don't exist upstream, so
- * bridge them to the nearest supported level instead of letting the API
- * silently ignore the request. Overridable per level via `effort:` in
- * config.yml (merged over these defaults). */
+ * V4 accepts all five natively, so nothing is bridged by default and this map
+ * is empty — an earlier version of this comment claimed medium and xhigh were
+ * rewritten, which stopped being true and disagreed with config.example.yml.
+ * Set `effort:` in config.yml to remap specific levels for other families. */
 const EFFORT_DEFAULT = {};
 const EFFORT_MAP =
   CFG.effort && typeof CFG.effort === "object"
@@ -801,7 +817,11 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
   // fallback on the same response.
   let handedOff = false;
 
-  function issueUpstream(attempts) {
+  // The body is a parameter, not a closure variable a retry reassigns: with
+  // several attempts in flight the headers, the write and the splice all have to
+  // agree on which body this attempt is sending, and reading a shared mutable
+  // binding at three different moments is a bug waiting for a scheduling change.
+  function issueUpstream(attempts, attemptBody) {
     // Set when a retry replaces this attempt, so the abandoned request's error
     // handler stays out of the way for the same reason.
     let superseded = false;
@@ -810,7 +830,7 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
     }
     // Fresh complete headers per attempt, built BEFORE request() — mutating a
     // shared headers object after request creation loses retry writes (Node 26).
-    const attemptHeaders = { ...headers, "content-length": String(forwardedBody.length) };
+    const attemptHeaders = { ...headers, "content-length": String(attemptBody.length) };
     const upstream = lib.request(
       { hostname: u.hostname, port: u.port || (u.protocol === "https:" ? 443 : 80), path: u.pathname + u.search, method: req.method ?? "POST", headers: attemptHeaders, ...(attempts > 1 ? { agent: false } : {}) },
       (up) => {
@@ -851,13 +871,12 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
           if (m && attempts < 3) {
             const idx = Number(m[1]);
             try {
-              const j = JSON.parse(forwardedBody.toString("utf8"));
+              const j = JSON.parse(attemptBody.toString("utf8"));
               if (Array.isArray(j.tools) && j.tools[idx]) {
                 j.tools.splice(idx, 1);
-                forwardedBody = Buffer.from(JSON.stringify(j));
                 superseded = true;
                 clearUpstreamTimeout();
-                issueUpstream(attempts + 1);
+                issueUpstream(attempts + 1, Buffer.from(JSON.stringify(j)));
                 return;
               }
             } catch {
@@ -885,10 +904,10 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
       }
       sendError(res, 502, "api_error", `deepseek upstream error: ${err.message}`);
     });
-    if (forwardedBody.length > 0) upstream.write(forwardedBody);
+    if (attemptBody.length > 0) upstream.write(attemptBody);
     upstream.end();
   }
-  issueUpstream(1);
+  issueUpstream(1, forwardedBody);
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,3 +1079,29 @@ server.on("error", (err) => {
 server.listen(PORT, HOST, () => {
   console.error(`[proxy] listening on http://${HOST}:${PORT}`);
 });
+
+// Answers in flight are long-lived SSE streams, so the default response to a
+// signal — drop everything the instant the process dies — truncates whatever
+// the user was reading. Stop accepting new connections, let the open ones
+// finish, and keep a hard deadline so a stuck stream can't block the shutdown
+// the launcher is waiting on.
+const SHUTDOWN_GRACE = 5000;
+let shuttingDown = false;
+
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.error(`[proxy] ${signal} — finishing in-flight responses`);
+  const deadline = setTimeout(() => {
+    console.error(`[proxy] still busy after ${SHUTDOWN_GRACE / 1000}s — exiting anyway`);
+    process.exit(0);
+  }, SHUTDOWN_GRACE);
+  deadline.unref(); // don't hold the loop open once everything has closed
+  server.close(() => {
+    for (const stream of [usageStream, debugStream]) stream?.end();
+    process.exit(0);
+  });
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
