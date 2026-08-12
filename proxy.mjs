@@ -34,7 +34,11 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 // Config: CLI args > config.yml > .env > defaults
 // ---------------------------------------------------------------------------
 
-const FALLBACK_STATUS = new Set([404, 429, 500, 501, 502, 503, 504]);
+// Statuses worth retrying the other way. 408 belongs here even though the proxy
+// sets its own upstream timeout: an intermediate (corporate proxy, tunnel) can
+// answer 408 before that timer fires, and without it that request would surface
+// as a hard failure rather than falling back.
+const FALLBACK_STATUS = new Set([404, 408, 429, 500, 501, 502, 503, 504]);
 
 function parseArgs(argv) {
   const out = { port: null, redir: false, fallback: null, config: null, debug: false, help: false, noAuthBridge: false, oauthRefresh: false };
@@ -60,8 +64,14 @@ function loadYaml(text) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
     const indent = line.length - line.trimStart().length;
-    const m = trimmed.match(/^([A-Za-z0-9_.-]+):\s*(.*)$/);
-    if (!m) continue;
+    // Quoted keys are valid YAML and an editor or formatter may well produce
+    // them; unquoted-only would drop `"port": 8016` on the floor and fall back
+    // to the default with no diagnostic.
+    const m = trimmed.match(/^"([^"]+)":\s*(.*)$/) ?? trimmed.match(/^'([^']+)':\s*(.*)$/) ?? trimmed.match(/^([A-Za-z0-9_.-]+):\s*(.*)$/);
+    if (!m) {
+      console.error(`[config] ignoring unparsable line in ${CONFIG_PATH}: ${trimmed.slice(0, 60)}`);
+      continue;
+    }
     while (stack.length > 1 && indent <= stack[stack.length - 1].indent) stack.pop();
     const key = m[1];
     const val = m[2].split(/\s+#/)[0].trim();
@@ -195,12 +205,17 @@ function summarizeBody(body, reqHeaders) {
   return out;
 }
 
+/** Accept the shorthand a redir map may be written with (`v4-flash`) and return
+ * the real DeepSeek id. Anything that is neither already a DeepSeek id nor a
+ * recognised shorthand is returned untouched: blindly prefixing turned a typo
+ * like `gpt-4` into the plausible-looking `deepseek-gpt-4`, which then 400s
+ * upstream with nothing pointing back at the config line that caused it. */
 const normalizeModel = (id) => {
   const s = String(id);
   if (s.includes("deepseek-")) return s;
-  if (s === "v4flash" || s === "v4-flash") return "deepseek-v4-flash";
-  if (s === "v4pro" || s === "v4-pro") return "deepseek-v4-pro";
-  return `deepseek-${s}`;
+  if (/^v\d+-?(flash|pro)$/.test(s)) return `deepseek-${s.replace(/^(v\d+)-?/, "$1-")}`;
+  console.error(`[config] redir target "${s}" is not a DeepSeek model id — using it as written`);
+  return s;
 };
 
 const DEFAULT_REDIR = {
@@ -224,11 +239,16 @@ const REDIR_MAP =
 
 const FAMILY_KEYS = REDIR_MAP ? Object.keys(REDIR_MAP) : [];
 
-/** First redir key contained in the model id — "claude-sonnet-4-5" -> "sonnet". */
+/** First redir key appearing as a segment of the model id — "claude-sonnet-4-5"
+ * -> "sonnet". Matched on non-alphanumeric boundaries rather than a bare
+ * substring test: `includes("opus")` would also claim a hypothetical
+ * "opusculum-1", quietly rerouting a model the user never mapped. */
 function familyOf(modelId) {
   if (!REDIR_MAP) return null;
   const id = String(modelId ?? "").toLowerCase();
-  for (const key of FAMILY_KEYS) if (id.includes(key)) return key;
+  for (const key of FAMILY_KEYS) {
+    if (new RegExp(`(^|[^a-z0-9])${key.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^a-z0-9]|$)`).test(id)) return key;
+  }
   return null;
 }
 
@@ -355,10 +375,10 @@ let credInFlight = null;
 const credWarned = new Set();
 let refreshInFlight = null;
 
-function warnOnce(message) {
+function warnOnce(message, scope = "auth-bridge") {
   if (credWarned.has(message)) return;
   credWarned.add(message);
-  console.error(`[auth-bridge] ${message}`);
+  console.error(`[${scope}] ${message}`);
 }
 
 /** Run a command. Returns stdout, or null on any non-zero exit — every caller
@@ -774,7 +794,17 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
         up.on("data", (c) => chunks.push(c));
         up.on("end", () => {
           const raw = Buffer.concat(chunks).toString("utf8");
-          const m = status === 400 && raw.includes("unknown variant") ? raw.match(/tools\[(\d+)\]/) : null;
+          // DeepSeek rejects tool types it doesn't know with a 400 naming the
+          // offending index; dropping that tool and retrying is what keeps a
+          // Claude Code session with newer tools usable. The index is read out
+          // of a prose error message, so the shape is DeepSeek's to change —
+          // when the marker is there but the index isn't, say so rather than
+          // forwarding an opaque 400 the user can do nothing with.
+          const unknownVariant = status === 400 && raw.includes("unknown variant");
+          const m = unknownVariant ? raw.match(/tools\[(\d+)\]/) : null;
+          if (unknownVariant && !m) {
+            warnOnce(`DeepSeek rejected an unknown tool variant but the error named no tools[N] index — cannot retry: ${raw.slice(0, 200)}`, "deepseek");
+          }
           if (m && attempts < 3) {
             const idx = Number(m[1]);
             try {
@@ -840,6 +870,17 @@ async function serveModels(req, res) {
   const ds = await deepseekModelList();
 
   // Never brick the harness on an Anthropic hiccup — serve DeepSeek models only.
+  // But say so: an empty or partial picker is the most visible symptom this
+  // proxy has, and silently returning half a list sends people hunting through
+  // Claude Code's model cache for a fault that is upstream of it.
+  if (!Array.isArray(anthropicModels.json?.data)) {
+    warnOnce(
+      anthropicModels.status === 0
+        ? "could not reach api.anthropic.com for the model list — serving DeepSeek models only"
+        : `api.anthropic.com returned ${anthropicModels.status} for the model list — serving DeepSeek models only`,
+      "models"
+    );
+  }
 
   const data = Array.isArray(anthropicModels.json?.data) ? [...anthropicModels.json.data] : [];
   const seen = new Set(data.map((m) => m.id));
