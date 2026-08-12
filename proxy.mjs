@@ -40,7 +40,7 @@ function parseArgs(argv) {
   const out = { port: null, redir: false, fallback: null, config: null, debug: false, help: false, noAuthBridge: false, oauthRefresh: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--port") out.port = Number(argv[++i]);
+    if (a === "--port") out.port = argv[++i] ?? null; // validated by firstPort()
     else if (a === "--redir") out.redir = true;
     else if (a === "--fallback") out.fallback = true;
     else if (a === "--config") out.config = argv[++i];
@@ -102,6 +102,25 @@ Config precedence: CLI args > config.yml > .env > defaults.`);
   process.exit(0);
 }
 
+/** Parse a `.env` file into a plain object. Defined here rather than beside the
+ * DeepSeek settings below because PORT resolution needs it — a `const ENV` read
+ * before its initializer throws at import time. */
+function loadEnv() {
+  const out = {};
+  try {
+    const raw = fs.readFileSync(path.join(HERE, ".env"), "utf8");
+    for (const line of raw.split(/\r?\n/)) {
+      const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+      if (m) out[m[1]] = m[2].trim().replace(/^["']|["']$/g, "");
+    }
+  } catch {
+    /* no .env */
+  }
+  return out;
+}
+
+const ENV = loadEnv();
+
 const CONFIG_PATH = ARGS.config ?? path.join(HERE, "config.yml");
 let CFG = {};
 try {
@@ -110,7 +129,24 @@ try {
   /* no config.yml — defaults stand */
 }
 
-const PORT = ARGS.port ?? CFG.port ?? Number(process.env.PORT ?? 8016);
+/** First source that yields a usable TCP port. Plain `??` chaining is wrong for
+ * this: `--port foo` produces NaN and `PORT=` in .env produces "", both of which
+ * are non-nullish and would win over every later source. */
+function firstPort(...candidates) {
+  for (const c of candidates) {
+    if (c == null || c === "") continue;
+    const n = Number(c);
+    if (Number.isInteger(n) && n >= 0 && n <= 65535) return n;
+    console.error(`[config] ignoring invalid port value ${JSON.stringify(c)}`);
+  }
+  return 8016;
+}
+
+// Documented precedence: CLI args > config.yml > real env > .env > default.
+const PORT = firstPort(ARGS.port, CFG.port, process.env.PORT, ENV.PORT);
+// Loopback only. The proxy holds the DeepSeek key and bridges the user's
+// Anthropic OAuth token, so a 0.0.0.0 bind would hand both to any LAN host.
+const HOST = CFG.host ?? "127.0.0.1";
 const UPSTREAM = "api.anthropic.com";
 
 // ---------------------------------------------------------------------------
@@ -198,21 +234,6 @@ function familyOf(modelId) {
 // Config from .env (real env vars win)
 // ---------------------------------------------------------------------------
 
-function loadEnv() {
-  const out = {};
-  try {
-    const raw = fs.readFileSync(path.join(HERE, ".env"), "utf8");
-    for (const line of raw.split(/\r?\n/)) {
-      const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
-      if (m) out[m[1]] = m[2].trim().replace(/^["']|["']$/g, "");
-    }
-  } catch {
-    /* no .env */
-  }
-  return out;
-}
-
-const ENV = loadEnv();
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY ?? ENV.DEEPSEEK_API_KEY ?? "";
 const DEEPSEEK_BASE_URL = (process.env.DEEPSEEK_BASE_URL ?? ENV.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com").replace(/\/+$/, "");
 const DEEPSEEK_ANTHROPIC_BASE = (process.env.DEEPSEEK_ANTHROPIC_BASE_URL ?? `${DEEPSEEK_BASE_URL}/anthropic`).replace(/\/+$/, "");
@@ -874,4 +895,17 @@ function handle(req, res) {
   });
 }
 
-http.createServer(handle).listen(PORT);
+const server = http.createServer(handle);
+
+// Without this, EADDRINUSE (a proxy already on the port) surfaces as an unhandled
+// 'error' event and a stack trace in the log. Exit non-zero with one readable
+// line instead; restarting is the launcher's job, not ours.
+server.on("error", (err) => {
+  if (err.code === "EADDRINUSE") console.error(`[proxy] port ${PORT} is already in use — is another proxy running?`);
+  else console.error(`[proxy] server error: ${err.message}`);
+  process.exit(1);
+});
+
+server.listen(PORT, HOST, () => {
+  console.error(`[proxy] listening on http://${HOST}:${PORT}`);
+});
