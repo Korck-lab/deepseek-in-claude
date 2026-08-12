@@ -131,7 +131,7 @@ Two Claude Code rules shape that id, and both are read off the id string alone:
 
 So the display id is `claude-deepseek-v4-flash[1m]`, labelled `DeepSeek V4 Flash` in the picker. The proxy rewrites it back to the real id (`deepseek-v4-flash`) on every upstream request — the marker is a Claude Code convention and would be rejected by DeepSeek. The bare display id and the real id both route to DeepSeek too.
 
-The discovery result is cached by Claude Code under `~/.claude/cache/gateway-models.json` keyed by base URL. After changing the proxy's model list, delete that file or restart.
+The discovery result is cached by Claude Code under `~/.claude/cache/gateway-models.json` keyed by base URL. The base URL never changes here, so a list captured before a proxy change survives a restart — after changing the model list, delete that file (`claudei.sh` does it whenever it starts a proxy). Upgrading to the `[1m]` ids counts: without the purge the picker keeps showing the old ids and a 200k window.
 
 ### Anthropic credential bridge
 

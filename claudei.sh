@@ -12,6 +12,10 @@ if lsof -ti :$PORT >/dev/null 2>&1; then
 else
   (cd "$PROXY_HOME" && PORT=$PORT nohup node proxy.mjs --fallback >/tmp/deepseek-proxy.log 2>&1 &)
   sleep 2
+  # Claude Code caches the discovered model list keyed by base URL, which never
+  # changes here — so a list captured before a proxy change would survive the
+  # restart and show stale ids. Drop it; the next launch repopulates it.
+  rm -f "$HOME/.claude/cache/gateway-models.json"
 fi
 
 echo "🚀 Starting claude code irrestrict..."
