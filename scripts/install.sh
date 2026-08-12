@@ -163,4 +163,9 @@ fi
 
 echo "==> done"
 echo "    start:   node $DEST/proxy.mjs"
-echo "    connect: ANTHROPIC_BASE_URL=http://localhost:8016 claude"
+# Both halves matter and neither is guessable: without the sentinel the CLI never
+# runs gateway discovery and DeepSeek stays out of the picker, and without the
+# unset an exported key rides along as x-api-key, which Anthropic prefers over the
+# bearer (ADR-0002). claudei.sh does all of this for you.
+echo "    connect: unset ANTHROPIC_API_KEY; ANTHROPIC_AUTH_TOKEN=\"\$(sed -n 's/^sentinel:[[:space:]]*//p' $CFG_FILE | head -n 1)\" ANTHROPIC_BASE_URL=http://localhost:8016 claude"
+echo "             (or just run claudei.sh, which handles both)"

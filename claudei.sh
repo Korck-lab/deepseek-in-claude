@@ -162,8 +162,37 @@ echo "🚀 Starting claude code irrestrict..."
 # writes a per-install random value there; if the key is absent, both fall back
 # to the historical literal. Parsing mirrors the proxy's YAML subset: strip an
 # inline comment (whitespace + #) and surrounding quotes.
+#
+# When that key is absent, the proxy still honours ANTHROPIC_AUTH_SENTINEL from
+# the environment it inherits, so this side has to read the same variable or the
+# two disagree and every Anthropic-model request 401s. It is not a credential —
+# it names the placeholder — which is why it survives the unset below while
+# ANTHROPIC_AUTH_TOKEN does not.
 SENTINEL="$(sed -n 's/^sentinel:[[:space:]]*//p' "$PROXY_HOME/config.yml" 2>/dev/null \
   | head -n 1 | sed 's/[[:space:]][[:space:]]*#.*$//' | tr -d "\"'" | tr -d '[:space:]')"
+
+# Whatever this shell already exports is cleared rather than deferred to, because
+# either variable outranks the sentinel at the upstream and moves your Anthropic
+# spend off the plan you already pay for (ADR-0002). ANTHROPIC_API_KEY is the
+# quiet one: the CLI sends it as x-api-key alongside the bearer, api.anthropic.com
+# prefers the key, so a valid one authenticates and bills every Anthropic request
+# to API credits while the sentinel swap still looks like it is working.
+# ANTHROPIC_AUTH_TOKEN is the loud one: it would win the ${:-} below and be
+# forwarded to Anthropic verbatim, bridging nothing. Mutating this shell's own
+# environment is safe because nothing below reads either name — SENTINEL comes
+# from config.yml alone, and the EXIT trap only stops the proxy.
+#
+# A value you deliberately exported vanishing without a word is its own surprise,
+# so say so. It goes to stdout beside the other 🚀 progress lines because it
+# reports a decision the launcher made, not a failure; only the name is printed,
+# never the value, since this text can end up in a pasted terminal log.
+IGNORED=""
+[ -n "${ANTHROPIC_API_KEY:-}" ] && IGNORED="ANTHROPIC_API_KEY"
+[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ] && IGNORED="${IGNORED:+$IGNORED and }ANTHROPIC_AUTH_TOKEN"
+if [ -n "$IGNORED" ]; then
+  echo "   ignoring $IGNORED from your shell: Anthropic models bill to your Claude plan, not API credits"
+fi
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
 
 # Permission prompts are skipped by default — that is what the "i" in claudei
 # is for — but it is a real safety switch, so it is a variable you can turn off
@@ -175,7 +204,7 @@ fi
 
 # shellcheck disable=SC2086
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 \
-ANTHROPIC_AUTH_TOKEN="${ANTHROPIC_AUTH_TOKEN:-${SENTINEL:-local-deepseek-proxy}}" \
+ANTHROPIC_AUTH_TOKEN="${SENTINEL:-${ANTHROPIC_AUTH_SENTINEL:-local-deepseek-proxy}}" \
 ANTHROPIC_BASE_URL=http://localhost:$PORT "$CLAUDE" $CLAUDE_FLAGS \
    --append-system-prompt "Be terse while keep information density. Forward terseness instruction to all sub-agents" \
    "$@"

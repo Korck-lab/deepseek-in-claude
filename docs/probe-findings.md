@@ -13,8 +13,11 @@ POST /v1/messages?beta=true → SSE stream, one call per turn
 
 - Print mode (`claude -p`) never calls `/v1/models` and never calls `count_tokens`.
   `count_tokens` + `/v1/models` appear in interactive sessions only.
-- Auth: CLI sends its own credential; proxy must pass auth through untouched (Anthropic
-  target) or substitute `x-api-key` (DeepSeek target, `proxy.mjs:403-404`).
+- Auth: CLI sends its own credential; the proxy substitutes `x-api-key` on the DeepSeek
+  target (`proxy.mjs:813-814`). On the Anthropic target it passes the `Authorization`
+  header through untouched *except* for the sentinel swap — and, since 2026-08-12, drops
+  any client-supplied `x-api-key` there (`applyAnthropicAuth`, see "Header precedence at
+  `api.anthropic.com`" in the second document below for the measurement that forced it).
 - `?beta=true` query param rides along on `/v1/messages` — DeepSeek accepts it.
 
 ## 2. Anthropic baseline (truth set, 15 runs: 3 models × 5 efforts)
@@ -72,7 +75,7 @@ unknown variant `advisor_20260301`, expected `web_search_20250305` or `web_searc
 | mutation | verdict |
 | --- | --- |
 | model id display→real / redir map (386-392) | required |
-| `x-api-key` substitution, `authorization` drop (403-404) | required |
+| `x-api-key` substitution, `authorization` drop, DeepSeek leg (813-814) | required |
 | `/v1/models` merge (448-486) | required (user-sanctioned) |
 | `count_tokens` answered locally bytes/4 (218, 374-378) | tolerable; real usage available in SSE and thrown away |
 | effort bridge medium→high, xhigh→max (363-367, 393-396) | **unnecessary** for v4 models — remove default |
@@ -201,3 +204,24 @@ refresh token, and a mis-persisted rotation would break the real CLI's own sessi
 OAuth constants used by the refresh grant (from the binary):
 `TOKEN_URL=https://platform.claude.com/v1/oauth/token`,
 `CLIENT_ID=9d1c250a-e61b-44d9-88ed-5944d1962f5e`.
+
+## 4. Header precedence at `api.anthropic.com` — added 2026-08-12
+
+Same sniffing harness, one header changed at a time, on `POST /v1/messages`:
+
+| Headers sent | Result |
+| --- | --- |
+| `Authorization: Bearer <sentinel-swapped OAuth token>` + bogus `x-api-key` | **401** |
+| the same `Authorization`, `x-api-key` removed | **200** |
+
+`api.anthropic.com` therefore honours `x-api-key` in preference to the `Authorization`
+bearer — the same precedence the `ANTHROPIC_API_KEY=<bogus>` row of §3's three-run table
+records against the claude.ai login, now isolated to the header rather than the env var.
+The damaging case is not the 401: a *bogus* key fails loudly, but a **valid** exported key
+in that slot authenticates and bills every Anthropic request to API credits while the
+credential bridge looks like it is working. Claude Code sends both headers whenever
+`ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY` are both set, which is what a launcher
+inherits from a shell that exports the key. Hence the two fixes of the same date:
+`claudei.sh` unsets both variables before launching the CLI, and `applyAnthropicAuth`
+drops `x-api-key` on the Anthropic leg — below the `--no-auth-bridge` escape hatch, above
+the sentinel gate. Guarded by `scripts/test-auth-bridge.sh`.

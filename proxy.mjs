@@ -372,6 +372,16 @@ function sendError(res, status, type, message) {
 // the macOS keychain, or ~/.claude/.credentials.json elsewhere — read-only
 // unless --oauth-refresh is passed, in which case an expired token is renewed
 // through the OAuth refresh grant and written back.
+//
+// Substituting the bearer is not sufficient on its own. On a shell that exports
+// ANTHROPIC_API_KEY the CLI sends `x-api-key` *alongside* the bearer, and
+// api.anthropic.com prefers the key over the Authorization header — measured
+// 2026-08-12, the identical request answers 401 with a bogus `x-api-key`
+// attached and 200 with it removed. A valid exported key in that slot would
+// therefore authenticate and bill every Anthropic request to API credits while
+// the bridge looked like it was working, which is precisely the outcome ADR-0002
+// forbids. Dropping the caller's `x-api-key` on the Anthropic leg is load-bearing
+// rather than hygiene.
 // ---------------------------------------------------------------------------
 
 const AUTH_BRIDGE = ARGS.noAuthBridge ? false : CFG.authBridge !== false;
@@ -555,9 +565,17 @@ async function anthropicAccessTokenOnce() {
 }
 
 /** Swap the sentinel for real credentials on the Anthropic leg. No-op for any
- * other Authorization value, so a real token is never touched. */
+ * other Authorization value, so a real token is never touched — but a
+ * client-supplied x-api-key is dropped whenever the bridge is on, whatever the
+ * bearer turns out to be. */
 async function applyAnthropicAuth(headers) {
   if (!AUTH_BRIDGE) return headers;
+  // Below the --no-auth-bridge escape hatch, so someone bringing their own real
+  // Anthropic credential still gets a genuine passthrough, and above the sentinel
+  // gate, because the paths that return early from it — a real bearer, or a
+  // credential lookup that yields nothing — are exactly the ones where a
+  // surviving x-api-key would quietly win the request and bill it to API credits.
+  delete headers["x-api-key"];
   if (headers.authorization !== `Bearer ${AUTH_SENTINEL}`) return headers;
   let token = null;
   try {

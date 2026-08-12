@@ -33,7 +33,12 @@ URL and populates the `/model` picker. Only runs when an auth env var is set.
 **Credential bridge** — the substitution of the caller's sentinel
 `ANTHROPIC_AUTH_TOKEN` for the user's real Claude Code OAuth token on the Anthropic leg.
 Disable with `--no-auth-bridge`. Not to be called "auth passthrough" — passthrough is
-what happens to a *real* credential, the bridge is a swap.
+what happens to a *real* credential, the bridge is a swap. The Anthropic leg must
+authenticate with the user's plan OAuth session and never with an Anthropic API key —
+enforced on both sides now: `claudei.sh` unsets `ANTHROPIC_API_KEY` and
+`ANTHROPIC_AUTH_TOKEN` before launching the CLI, and the bridge drops any
+client-supplied `x-api-key` on the Anthropic leg, because Anthropic prefers that header
+over the bearer. See ADR-0002 and its guard suite, `scripts/test-auth-bridge.sh`.
 
 **Sentinel** — the placeholder auth value Claude Code is given. Random per install, stored as `sentinel:` in `config.yml` (the single source of truth for both the proxy and `claudei.sh`); falls back to `local-deepseek-proxy` when that file is absent.
 It is not a credential and never leaves the proxy.
@@ -57,7 +62,7 @@ Sections in file order:
 | Usage log | one JSON line per DeepSeek request, always on |
 | DeepSeek routing | transparent forward to the Anthropic-compatible endpoint |
 | Merged model list | serves `GET /v1/models` — union of both legs |
-| Anthropic forward | untouched passthrough |
+| Anthropic forward | body untouched; credential headers reworked by the bridge |
 | Server | request dispatch |
 
 ## Deployment topology — read this before debugging
@@ -100,8 +105,15 @@ diff its `/v1/models` output against the live one.
 
 ## Verification
 
-`scripts/test.sh` is the suite (19 cases, no network required for most). `T2c` and `T13`
-cover the display-id contract from ADR-0001.
+`scripts/test.sh` is the suite: its own inline `T*` cases, plus the unit and race suites it
+invokes itself — `test-parsing`, `test-model-race`, `test-auth-bridge` — with
+`test-fallback-race` gated behind `RUN_SLOW_TESTS=1` because it spends real API traffic.
+Most cases need no network. Counting cases here has gone stale repeatedly; run the suite for
+the number. `T2c` and `T13` cover the display-id contract from ADR-0001;
+`scripts/test-auth-bridge.sh` is the guard for ADR-0002 — half of it slices
+`forwardHeaders` + `applyAnthropicAuth` out of `proxy.mjs` to assert no `x-api-key` reaches
+the Anthropic leg, half drives `claudei.sh` against a stub CLI that dumps its environment.
+Both ADRs' guards must not be deleted as redundant.
 
 `scripts/observe.mjs` sniffs live traffic; `scripts/probe.mjs` runs a `claude -p` matrix
 across models and effort levels. Findings from the last full run are in

@@ -133,7 +133,7 @@ fi
 # its own fixtures, but invoked from here so they cannot rot unnoticed — nobody
 # runs a suite they have to know the name of.
 echo "==> unit and race suites"
-for suite in test-parsing test-model-race; do
+for suite in test-parsing test-model-race test-auth-bridge; do
   if bash "$HERE_SCRIPTS/$suite.sh" >"$TMP/$suite.out" 2>&1; then
     PASS=$((PASS + 1)); echo "PASS  $suite"
   else

@@ -4,9 +4,13 @@
  * Sits between Claude Code and an upstream (Anthropic or DeepSeek), forwards
  * every request, streams the response back, and writes full request/response
  * captures to logs/probe/. Target auth handling matches proxy.mjs:
- *   --target anthropic  — headers pass through untouched (CLI keychain auth)
+ *   --target anthropic  — headers pass through untouched (CLI keychain auth).
+ *                         Raw passthrough on purpose: this harness exists to
+ *                         capture what the CLI really sends, so unlike the proxy
+ *                         it does NOT enforce ADR-0002 and will forward an
+ *                         x-api-key you have exported straight to Anthropic.
  *   --target deepseek   — x-api-key substituted from .env DEEPSEEK_API_KEY,
- *                         authorization dropped (proxy.mjs:403-404)
+ *                         authorization dropped (proxy.mjs:813-814)
  *
  * Run:   node scripts/observe.mjs --port 8788 --target anthropic
  *
