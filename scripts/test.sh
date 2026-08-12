@@ -9,7 +9,8 @@
 # Real API calls are tiny ("Reply with exactly: OK") but cost a few cents.
 set -uo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+HERE_SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE_SCRIPTS/.." && pwd)"
 CLAUDE="${CLAUDE:-$(command -v claude || echo "$HOME/.local/bin/claude")}"
 TMP="$(mktemp -d)"
 MOCK_PORT=8801
@@ -125,6 +126,33 @@ if [ "$preflight_failed" -ne 0 ]; then
   echo "==> pre-flight failed; not running tests" >&2
   exit 1
 fi
+
+# --- unit and race suites ----------------------------------------------------
+# Run first: they are fast, need no credentials, and a failure here explains any
+# feature failure that follows. Kept as separate scripts because each stands up
+# its own fixtures, but invoked from here so they cannot rot unnoticed — nobody
+# runs a suite they have to know the name of.
+echo "==> unit and race suites"
+for suite in test-parsing test-model-race; do
+  if bash "$HERE_SCRIPTS/$suite.sh" >"$TMP/$suite.out" 2>&1; then
+    PASS=$((PASS + 1)); echo "PASS  $suite"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL  $suite"; sed 's/^/      /' "$TMP/$suite.out" | tail -15
+  fi
+done
+
+# The fallback race suite drives the real Anthropic leg — it needs working
+# credentials and spends roughly 2.5k output tokens — so it is opt-in.
+if [ "${RUN_SLOW_TESTS:-0}" = "1" ]; then
+  if bash "$HERE_SCRIPTS/test-fallback-race.sh" >"$TMP/fallback.out" 2>&1; then
+    PASS=$((PASS + 1)); echo "PASS  test-fallback-race"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL  test-fallback-race"; sed 's/^/      /' "$TMP/fallback.out" | tail -15
+  fi
+else
+  echo "SKIP  test-fallback-race (RUN_SLOW_TESTS=1 to include; real API traffic)"
+fi
+echo ""
 
 # ---------------------------------------------------------------------------
 echo "==> deepseek-in-claude feature tests"

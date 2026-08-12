@@ -61,7 +61,9 @@ confirmed to fail on the commit before its fix:
   abandoned leg's timer fires mid-stream. Needs credentials and spends ~2.5k
   output tokens; skips itself if the auth bridge cannot authenticate.
 
-`scripts/test.sh` passes 19/19 throughout.
+`scripts/test.sh` runs the first two suites itself and gates the third behind
+`RUN_SLOW_TESTS=1`, so none of them depends on someone knowing its name. It
+passes 21/21, or 22/22 with the slow suite included.
 
 ## Known limits
 
