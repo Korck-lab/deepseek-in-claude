@@ -26,7 +26,7 @@ credential:
 Anthropic's own documentation specifies the feature, including the response schema and the
 cache path: <https://code.claude.com/docs/en/llm-gateway-protocol#model-discovery>.
 
-Measured 2026-08-12 with `sniffer.sh`, a raw tap that neither bridges credentials nor merges
+Measured 2026-08-12 with a raw tapping proxy (`sniffer.sh`, removed after the investigation — recover it from git history at v0.7.0), which neither bridged credentials nor merged
 models: with a hand-written cache, the discovery flag set, and **no auth variable exported**,
 the picker listed the seeded models as "From gateway" and the capture contained no
 `GET /v1/models` at all (`docs/probe-findings.md` §5.3).

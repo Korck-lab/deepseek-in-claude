@@ -167,7 +167,7 @@ needs a credential:
 
 So the picker can be populated by writing that file directly. `claudei.sh` now seeds it from
 the proxy's own `/_proxy/deepseek-models`, and launches the CLI with no auth variable.
-Measured 2026-08-12 through `sniffer.sh`, a raw tap: the DeepSeek rows list, and the capture
+Measured 2026-08-12 through a raw tapping proxy (`sniffer.sh`, removed after the investigation — recover it from git history at v0.7.0): the DeepSeek rows list, and the capture
 contains no `GET /v1/models` at all (docs/probe-findings.md §5.3).
 
 What this buys, beyond simplicity: Claude Code disables claude.ai connectors whenever it

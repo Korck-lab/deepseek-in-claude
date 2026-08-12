@@ -21,7 +21,7 @@ Your Anthropic account keeps working: only DeepSeek-model traffic goes to DeepSe
 curl -fsSL https://raw.githubusercontent.com/Korck-lab/deepseek-in-claude/main/scripts/install.sh | bash
 ```
 
-Then start Claude Code and pick a model with `/model`.
+Then run `claudei` from anywhere and pick a model with `/model`.
 
 </div>
 
@@ -79,7 +79,7 @@ ANTHROPIC_BASE_URL=http://localhost:8016 claude
 
 Then run `/model` and pick `DeepSeek V4 Flash` (or `DeepSeek V4 Pro`). Anthropic models keep working in the same session — see [Anthropic credential bridge](#anthropic-credential-bridge) for how.
 
-For the `/model` picker to list the DeepSeek models, Claude Code must run in gateway-discovery mode. That takes exactly two env vars beyond the base URL — the proxy ships `claudei.sh` which sets them, or set them yourself:
+For the `/model` picker to list the DeepSeek models, Claude Code needs the discovery flag and a seeded model cache. `claudei` does both, or do it yourself:
 
 ```bash
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
@@ -101,9 +101,11 @@ You can also skip discovery entirely and name the model directly — this needs 
 ANTHROPIC_BASE_URL=http://localhost:8016 claude --model 'claude-deepseek-v4-flash[1m]'
 ```
 
-### The `claudei.sh` launcher
+### The `claudei` launcher
 
-`claudei.sh` is a convenience launcher: it updates the `claude` CLI, starts the proxy on `:8016` (reusing it if already running), and boots Claude Code with gateway discovery enabled.
+`claudei.sh` is a convenience launcher: it updates the `claude` CLI, starts the proxy on `:8016` (reusing it if already running), seeds the `/model` picker's DeepSeek rows, and boots Claude Code.
+
+`scripts/install.sh` symlinks it to `~/.local/bin/claudei`, so `claudei` works from any directory. It is a symlink rather than a copy so `git pull` in the checkout updates the command too; set `CLAUDEI_BIN_DIR` to link it somewhere else. The launcher finds the checkout through `DEEPSEEK_IN_CLAUDE_HOME` (default `~/.deepseek-in-claude`), never through its own path, so invoking it by symlink, by absolute path, or from the checkout all behave identically.
 
 It clears `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` from the environment it hands the CLI — either would move your Anthropic spend onto API credits, and either disables claude.ai connectors — and prints which of them it ignored, by name only, if you had either exported. It sets neither in their place: the DeepSeek rows come from the model cache it seeds from the proxy, not from an authenticated discovery fetch.
 
@@ -111,7 +113,7 @@ It stops the proxy again on the way out — including after Ctrl+C — and refus
 
 The `claude` invocation is plain and easy to customize — edit the launch line to suit your setup. Common tweaks:
 
-- `--dangerously-skip-permissions` — skip permission prompts. On by default (that is the `i` in `claudei`); turn it off for a session with `CLAUDEI_SKIP_PERMISSIONS=0 ./claudei.sh`.
+- `--dangerously-skip-permissions` — skip permission prompts. On by default (that is the `i` in `claudei`); turn it off for a session with `CLAUDEI_SKIP_PERMISSIONS=0 claudei`.
 - `--autocompact N` — compaction threshold in tokens. Note that it also *caps* the reported context window: passing `--autocompact 350k` makes a 1M-window model report 350k. The launcher no longer sets it.
 - `--append-system-prompt "..."` — extra instructions injected on every session.
 - `--model <id>` — start on a specific model instead of the last-used default.
@@ -147,7 +149,7 @@ Two Claude Code rules shape that id, and both are read off the id string alone:
 
 So the display id is `claude-deepseek-v4-flash[1m]`, labelled `DeepSeek V4 Flash` in the picker. The proxy rewrites it back to the real id (`deepseek-v4-flash`) on every upstream request — the marker is a Claude Code convention and would be rejected by DeepSeek. The bare display id and the real id both route to DeepSeek too.
 
-The discovery result is cached by Claude Code under `~/.claude/cache/gateway-models.json` keyed by base URL. The base URL never changes here, so a list captured before a proxy change survives a restart — after changing the model list, delete that file (`claudei.sh` does it whenever it starts a proxy). Upgrading to the `[1m]` ids counts: without the purge the picker keeps showing the old ids and a 200k window.
+Claude Code reads the `/model` picker's gateway rows from `~/.claude/cache/gateway-models.json`, keyed by base URL. The base URL never changes here, so a list written before a proxy change survives a restart — after changing the model list, delete that file (`claudei.sh` purges and reseeds it on every run). Upgrading to the `[1m]` ids counts: without the purge the picker keeps showing the old ids and a 200k window.
 
 ### Anthropic credential bridge
 
@@ -157,13 +159,13 @@ The problem it solves: the discovery *fetch* only runs when Claude Code has an a
 
 The proxy resolves it. `ANTHROPIC_AUTH_TOKEN` is a sentinel; requests arriving with exactly that value get your real Claude Code OAuth access token substituted on the Anthropic leg, plus the `oauth-2025-04-20` beta that path requires. Any other `Authorization` value passes through untouched, so a real token is never rewritten. An `x-api-key` header is the exception: whenever the bridge is on it is dropped on the Anthropic leg regardless of the bearer, because Anthropic honours it in preference to the bearer and would bill the request to API credits instead of your plan.
 
-Because presenting the sentinel is what buys a request your OAuth token, it is not a published constant: `scripts/install.sh` generates a random one per install and writes it to `sentinel:` in `config.yml`. That file is the single source of truth — the proxy reads it, and `claudei.sh` reads it back to hand Claude Code the matching value. Without a `config.yml`, both sides fall back to the historical `local-deepseek-proxy`, so old checkouts keep working.
+Because presenting the sentinel is what buys a request your OAuth token, it is not a published constant: `scripts/install.sh` generates a random one per install and writes it to `sentinel:` in `config.yml`. The proxy reads it; a hand-rolled launch has to pass the same value as `ANTHROPIC_AUTH_TOKEN`. `claudei.sh` no longer sets that variable at all. Without a `config.yml`, both sides fall back to the historical `local-deepseek-proxy`, so old checkouts keep working.
 
 - Credentials are read from the store the CLI itself uses — the macOS keychain item `Claude Code-credentials`, or `~/.claude/.credentials.json` elsewhere. They are never logged and never leave your machine except to `api.anthropic.com`.
 - The store is read-only by default. When the access token expires, the proxy warns and Anthropic models 401 until something refreshes it — running `claude` normally does, and the proxy re-reads the store every 30s.
 - `--oauth-refresh` (or `oauthRefresh: true`) lets the proxy run the OAuth refresh grant itself and write the rotated token back. It is opt-in on purpose: this is the only path that writes to the credentials the real CLI depends on, and it has not been exercised against the live token endpoint — a bad rotation costs you a `/login`. On macOS the write also passes the credential blob to `security` as a command-line argument, so it is briefly visible to `ps`; both argv-free routes that CLI offers silently truncate a payload this size, and a partial write is the worse failure.
 - `--no-auth-bridge` (or `authBridge: false` in `config.yml`) turns the whole bridge off, including the `x-api-key` strip — it is a full passthrough for diagnosing with your own real Anthropic credential, which is exactly why the strip sits behind this switch and not in front of it. In sentinel mode without the bridge, Anthropic models 401.
-- `ANTHROPIC_AUTH_SENTINEL` changes the sentinel value the proxy accepts (`sentinel:` in `config.yml` wins over it). `claudei.sh` reads the same variable, so exporting it keeps both sides in step; on a hand-rolled launch you have to set `ANTHROPIC_AUTH_TOKEN` to the same value yourself — a mismatch 401s every Anthropic request.
+- `ANTHROPIC_AUTH_SENTINEL` changes the sentinel value the proxy accepts (`sentinel:` in `config.yml` wins over it). Only relevant if you set `ANTHROPIC_AUTH_TOKEN` yourself: it must match, or every Anthropic request 401s.
 
 Don't want the proxy near your credentials at all? Skip discovery and pass `--model 'claude-deepseek-v4-flash[1m]'` — no auth env var, no sentinel, nothing to swap.
 

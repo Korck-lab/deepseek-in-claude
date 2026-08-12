@@ -309,8 +309,8 @@ the same session, so this is a trade to make deliberately.
 
 ### 5.3 The cache lists models with no fetch and no credential
 
-Measured 2026-08-12 with `sniffer.sh`, which is a raw tap that neither bridges credentials
-nor merges models. `~/.claude/cache/gateway-models.json` was hand-written, the discovery
+Measured 2026-08-12 with a raw tapping proxy (`sniffer.sh`, removed after the investigation — recover it from git history at v0.7.0), which neither bridged credentials
+nor merged models. `~/.claude/cache/gateway-models.json` was hand-written, the discovery
 flag set, and no auth environment variable exported at all:
 
 ```

@@ -161,11 +161,46 @@ if ! grep -q '^sentinel:' "$CFG_FILE"; then
   echo "==> generated a per-install auth sentinel in $CFG_FILE"
 fi
 
+# --- global launcher --------------------------------------------------------
+# A symlink rather than a copy: the checkout is what `git pull` updates, so a
+# copy would silently keep running the version installed on the day it was made.
+# claudei.sh resolves the checkout from DEEPSEEK_IN_CLAUDE_HOME or $HOME, never
+# from $0, so it behaves identically however it is invoked.
+#
+# ~/.local/bin is the default because it is the conventional per-user bin
+# directory and needs no sudo. Nothing here writes outside $HOME.
+BIN_DIR="${CLAUDEI_BIN_DIR:-$HOME/.local/bin}"
+LINK="$BIN_DIR/claudei"
+
+mkdir -p "$BIN_DIR"
+if [ -e "$LINK" ] && [ ! -L "$LINK" ]; then
+  # Someone else's file with our name. Overwriting it would be the installer
+  # destroying data it does not own.
+  echo "warning: $LINK exists and is not a symlink — leaving it alone." >&2
+  echo "         Run claudei.sh from $DEST, or set CLAUDEI_BIN_DIR." >&2
+else
+  ln -sf "$DEST/claudei.sh" "$LINK"
+  chmod +x "$DEST/claudei.sh" 2>/dev/null || true
+  echo "==> linked $LINK -> $DEST/claudei.sh"
+
+  # A symlink in a directory that is not on PATH is a command the user cannot
+  # run, and the failure ("command not found") says nothing about why. Check the
+  # real PATH rather than assuming the conventional directory is on it.
+  case ":$PATH:" in
+    *":$BIN_DIR:"*) ;;
+    *)
+      echo "    note: $BIN_DIR is not on your PATH. Add it:" >&2
+      echo "          echo 'export PATH=\"$BIN_DIR:\$PATH\"' >> ~/.zshrc   # or ~/.bashrc" >&2
+      ;;
+  esac
+fi
+
 echo "==> done"
+echo "    run:     claudei                      # from anywhere"
 echo "    start:   node $DEST/proxy.mjs"
 # No auth variable is set here on purpose: either one moves Anthropic spend onto
 # API credits (ADR-0002) and disables claude.ai connectors. DeepSeek reaches the
 # picker through the seeded model cache instead, which claudei.sh writes — hence
 # pointing at it rather than printing a recipe that would leave the picker empty.
 echo "    connect: unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN; CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 ANTHROPIC_BASE_URL=http://localhost:8016 claude"
-echo "             (DeepSeek models need the picker cache seeded — run claudei.sh, which does it)"
+echo "             (DeepSeek models need the picker cache seeded — run claudei, which does it)"
