@@ -358,9 +358,17 @@ function warnOnce(message) {
   console.error(`[auth-bridge] ${message}`);
 }
 
-const run = (cmd, args) =>
+/** Run a command, optionally feeding it stdin. Returns stdout, or null on any
+ * non-zero exit — every caller treats failure as "credential store unavailable"
+ * and falls back, so the exit code itself carries no extra information. */
+const run = (cmd, args, stdin = null) =>
   new Promise((resolve) => {
-    execFile(cmd, args, { encoding: "utf8" }, (err, stdout) => resolve(err ? null : stdout));
+    const child = execFile(cmd, args, { encoding: "utf8" }, (err, stdout) => resolve(err ? null : stdout));
+    if (stdin == null) return;
+    child.stdin.on("error", () => {
+      /* command exited before reading stdin — the callback above reports it */
+    });
+    child.stdin.end(stdin);
   });
 
 /** Read the CLI's credential store. Returns { creds, store } or null. */
@@ -384,14 +392,17 @@ async function readCredentials() {
 
 /** Persist rotated tokens so normal `claude` sessions keep working. Never
  * throws: a token we hold is still usable in memory even if the store rejects
- * it, and losing it over a failed write would 401 a request that could succeed.
- * Note the keychain path passes the payload in argv, so it is briefly visible
- * to `ps` — one more reason refreshing is opt-in. */
+ * it, and losing it over a failed write would 401 a request that could succeed. */
 async function writeCredentials(store, creds) {
   try {
     const raw = JSON.stringify(creds);
     if (store === "keychain") {
-      await run("security", ["add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", os.userInfo().username, "-w", raw]);
+      // `-w` with no value reads the password from stdin, prompting twice for
+      // confirmation — so the payload goes in as two lines. Passing it as an
+      // argv element instead would expose the access and refresh tokens to
+      // `ps` for the lifetime of the call. JSON.stringify escapes newlines, so
+      // the payload is always a single line and the two reads stay aligned.
+      await run("security", ["add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", os.userInfo().username, "-w"], `${raw}\n${raw}\n`);
       return;
     }
     fs.writeFileSync(CREDENTIALS_FILE, raw, { mode: 0o600 });
