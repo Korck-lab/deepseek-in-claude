@@ -24,6 +24,11 @@ redir:
 # Implied by `--redir`; set false to disable.
 fallback: true
 
+# Idle-socket timeout for every upstream leg, in milliseconds (default 60000).
+# Streaming responses reset it on each chunk, so it bounds silence rather than
+# total duration — a long answer will not trip it, a dead connection will.
+upstreamTimeoutMs: 60000
+
 # Log every request/response shape to /tmp/deepseek-proxy-payloads.jsonl.
 # Equivalent to `--debug` on the CLI. Content and auth headers never logged.
 debug: false

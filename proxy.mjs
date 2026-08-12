@@ -44,7 +44,7 @@ function parseArgs(argv) {
   const out = { port: null, redir: false, fallback: null, config: null, debug: false, help: false, noAuthBridge: false, oauthRefresh: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--port") out.port = argv[++i] ?? null; // validated by firstPort()
+    if (a === "--port") out.port = argv[++i] ?? null; // validated by firstInt()
     else if (a === "--redir") out.redir = true;
     else if (a === "--fallback") out.fallback = true;
     else if (a === "--config") out.config = argv[++i];
@@ -146,27 +146,32 @@ try {
   /* no config.yml — defaults stand */
 }
 
-/** First source that yields a usable TCP port. Plain `??` chaining is wrong for
- * this: `--port foo` produces NaN and `PORT=` in .env produces "", both of which
- * are non-nullish and would win over every later source. */
-function firstPort(...candidates) {
+/** First source that yields a positive integer. Plain `??` chaining is wrong
+ * for these: `--port foo` produces NaN and `PORT=` in .env produces "", both of
+ * which are non-nullish and would win over every later source. */
+function firstInt(candidates, fallback, label, max = Number.MAX_SAFE_INTEGER) {
   for (const c of candidates) {
     if (c == null || c === "") continue;
     const n = Number(c);
-    // 0 is a valid listen() argument but means "any free port", which nothing
-    // pointed at a fixed base URL could ever reach — reject it like any junk.
-    if (Number.isInteger(n) && n > 0 && n <= 65535) return n;
-    console.error(`[config] ignoring invalid port value ${JSON.stringify(c)}`);
+    // 0 is a legal listen() argument but means "any free port", which nothing
+    // pointed at a fixed base URL could reach — reject it like any other junk.
+    if (Number.isInteger(n) && n > 0 && n <= max) return n;
+    console.error(`[config] ignoring invalid ${label} value ${JSON.stringify(c)}`);
   }
-  return 8016;
+  return fallback;
 }
 
 // Documented precedence: CLI args > config.yml > real env > .env > default.
-const PORT = firstPort(ARGS.port, CFG.port, process.env.PORT, ENV.PORT);
+const PORT = firstInt([ARGS.port, CFG.port, process.env.PORT, ENV.PORT], 8016, "port", 65535);
 // Loopback only. The proxy holds the DeepSeek key and bridges the user's
 // Anthropic OAuth token, so a 0.0.0.0 bind would hand both to any LAN host.
 const HOST = CFG.host ?? "127.0.0.1";
 const UPSTREAM = "api.anthropic.com";
+// Idle-socket timeout for every upstream leg. Streaming responses reset it on
+// each chunk, so it bounds silence, not total duration. Configurable mainly so
+// the fallback-race test can reach the path where an abandoned leg's timer
+// fires while the other leg is still streaming.
+const UPSTREAM_TIMEOUT = firstInt([CFG.upstreamTimeoutMs, process.env.UPSTREAM_TIMEOUT_MS, ENV.UPSTREAM_TIMEOUT_MS], 60000, "upstream timeout");
 
 // ---------------------------------------------------------------------------
 // Payload debug log — `--debug` writes one JSON line per request/response so the
@@ -336,6 +341,9 @@ function fetchJson(url, options = {}) {
 }
 
 function sendError(res, status, type, message) {
+  // A late error can arrive after another leg already finished this response —
+  // writing then throws ERR_STREAM_WRITE_AFTER_END and takes down the handler.
+  if (res.writableEnded || res.destroyed) return;
   if (!res.headersSent) res.writeHead(status ?? 500, { "content-type": "application/json" });
   res.end(JSON.stringify({ type: "error", error: { type: type ?? "api_error", message } }));
 }
@@ -390,10 +398,21 @@ function warnOnce(message, scope = "auth-bridge") {
 
 /** Run a command. Returns stdout, or null on any non-zero exit — every caller
  * treats failure as "credential store unavailable" and falls back, so the exit
- * code itself carries no extra information. */
+ * code itself carries no extra information.
+ *
+ * The timeout is the point: `security` can block indefinitely on a keychain
+ * that is locked or prompting, and without a bound that hangs the auth bridge
+ * for the life of the process rather than for one request. Killed runs are
+ * called out by name, since "no credentials found" would be a misleading
+ * account of a keychain that is simply waiting on the user. */
+const CRED_CMD_TIMEOUT = 10000;
+
 const run = (cmd, args) =>
   new Promise((resolve) => {
-    execFile(cmd, args, { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 }, (err, stdout) => resolve(err ? null : stdout));
+    execFile(cmd, args, { encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: CRED_CMD_TIMEOUT, killSignal: "SIGKILL" }, (err, stdout) => {
+      if (err?.killed) warnOnce(`\`${cmd}\` did not answer within ${CRED_CMD_TIMEOUT / 1000}s — is the keychain locked or prompting?`);
+      resolve(err ? null : stdout);
+    });
   });
 
 /** Read the CLI's credential store. Returns { creds, store } or null. */
@@ -774,7 +793,21 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
   let sentModel = null;
   try { sentModel = JSON.parse(forwardedBody.toString("utf8"))?.model ?? null; } catch { /* non-JSON */ }
 
+  // One client response, one writer. Once the fallback path hands `res` to
+  // forwardToAnthropic this leg must never touch it again: a late socket error
+  // on the abandoned DeepSeek request would otherwise either destroy a response
+  // the Anthropic leg is midway through streaming, or — if it errored before
+  // that leg wrote its head, so `headersSent` is still false — start a *second*
+  // fallback on the same response.
+  let handedOff = false;
+
   function issueUpstream(attempts) {
+    // Set when a retry replaces this attempt, so the abandoned request's error
+    // handler stays out of the way for the same reason.
+    let superseded = false;
+    function clearUpstreamTimeout() {
+      upstream.setTimeout(0);
+    }
     // Fresh complete headers per attempt, built BEFORE request() — mutating a
     // shared headers object after request creation loses retry writes (Node 26).
     const attemptHeaders = { ...headers, "content-length": String(forwardedBody.length) };
@@ -784,6 +817,8 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
         const status = up.statusCode ?? 502;
         if (FALLBACK && redir && FALLBACK_STATUS.has(status)) {
           up.resume(); // drain so the socket frees
+          handedOff = true;
+          clearUpstreamTimeout();
           void forwardToAnthropic(req, res, reqPath, body, null).catch((err) => sendError(res, 502, "api_error", err.message)); // original model + body
           return;
         }
@@ -792,6 +827,7 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
           const respChunks = [];
           up.on("data", (c) => { respChunks.push(c); res.write(c); });
           up.on("end", () => {
+            clearUpstreamTimeout();
             res.end();
             logUsage({ method: req.method, path: reqPath, status, ms: Date.now() - started, model: sentModel, usage: decodeSse(Buffer.concat(respChunks).toString("utf8")) });
           });
@@ -819,6 +855,8 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
               if (Array.isArray(j.tools) && j.tools[idx]) {
                 j.tools.splice(idx, 1);
                 forwardedBody = Buffer.from(JSON.stringify(j));
+                superseded = true;
+                clearUpstreamTimeout();
                 issueUpstream(attempts + 1);
                 return;
               }
@@ -826,16 +864,22 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
               /* fall through to error forward */
             }
           }
+          clearUpstreamTimeout();
           res.writeHead(status, cleanResponseHeaders(up.headers));
           res.end(raw);
           logUsage({ method: req.method, path: reqPath, status, ms: Date.now() - started, model: sentModel, usage: null });
         });
       }
     );
-    upstream.setTimeout(60000, () => upstream.destroy(new Error("upstream timeout")));
+    // Idle-socket timeout, disarmed once the exchange is over. Left armed, it
+    // rides the socket back into the keep-alive pool and fires its destroy
+    // callback on a connection no longer tied to this request.
+    upstream.setTimeout(UPSTREAM_TIMEOUT, () => upstream.destroy(new Error("upstream timeout")));
     upstream.on("error", (err) => {
+      if (superseded || handedOff) return;
       if (res.headersSent) { res.destroy(); return; }
       if (FALLBACK && redir) {
+        handedOff = true;
         void forwardToAnthropic(req, res, reqPath, body, null).catch((e) => sendError(res, 502, "api_error", e.message));
         return;
       }
@@ -870,6 +914,9 @@ async function serveModels(req, res) {
         });
       }
     );
+    // The model list had no timeout at all: a connection that opened and then
+    // went silent would hang /v1/models forever, and with it the picker.
+    upstream.setTimeout(UPSTREAM_TIMEOUT, () => upstream.destroy(new Error("models timeout")));
     upstream.on("error", () => resolve({ status: 0, json: null }));
     upstream.end();
   });
@@ -920,29 +967,39 @@ function rewriteModel(body, model) {
 
 async function forwardToAnthropic(req, res, reqPath, body, fb) {
   const headers = await applyAnthropicAuth(forwardHeaders(req.headers, body));
+  // Mirror image of the guard in handleDeepSeek: once this leg falls back, the
+  // DeepSeek leg owns the response and a late error here must not touch it.
+  let handedOff = false;
+  const clearUpstreamTimeout = () => upstream.setTimeout(0);
   const upstream = https.request(
     { hostname: UPSTREAM, port: 443, path: reqPath, method: req.method, headers },
     (up) => {
       const status = up.statusCode ?? 502;
       if (FALLBACK && fb && FALLBACK_STATUS.has(status)) {
         up.resume(); // drain so the socket frees
+        handedOff = true;
+        clearUpstreamTimeout();
         handleDeepSeek(req, res, rewriteModel(body, fb.mapped), reqPath, null);
         return;
       }
       res.writeHead(status, cleanResponseHeaders(up.headers));
       up.on("data", (c) => res.write(c));
-      up.on("end", () => res.end());
+      up.on("end", () => {
+        clearUpstreamTimeout();
+        res.end();
+      });
     }
   );
-  upstream.setTimeout(60000, () => upstream.destroy(new Error("upstream timeout")));
+  upstream.setTimeout(UPSTREAM_TIMEOUT, () => upstream.destroy(new Error("upstream timeout")));
   upstream.on("error", (err) => {
+    if (handedOff) return;
     if (res.headersSent) { res.destroy(); return; }
     if (FALLBACK && fb) {
+      handedOff = true;
       handleDeepSeek(req, res, rewriteModel(body, fb.mapped), reqPath, null);
       return;
     }
-    res.writeHead(502, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: `agent-proxy upstream error: ${err.message}` }));
+    sendError(res, 502, "api_error", `agent-proxy upstream error: ${err.message}`);
   });
   if (body.length > 0) upstream.write(body);
   upstream.end();

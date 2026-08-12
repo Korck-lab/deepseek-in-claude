@@ -190,6 +190,7 @@ All variables come from `.env` or real environment variables (real vars win). On
 | `DEEPSEEK_MODEL` | `deepseek-v4-pro,deepseek-v4-flash` | Comma-separated model fallbacks shown in the picker. |
 | `DEEPSEEK_ANTHROPIC_BASE_URL` | `$DEEPSEEK_BASE_URL/anthropic` | DeepSeek's Anthropic-compatible endpoint. |
 | `PORT` | `8016` | Proxy listen port. |
+| `UPSTREAM_TIMEOUT_MS` | `60000` | Idle-socket timeout for each upstream leg. Streaming resets it per chunk, so it bounds silence, not total duration. |
 | `ANTHROPIC_AUTH_SENTINEL` | `sentinel:` in `config.yml`, else `local-deepseek-proxy` | The `ANTHROPIC_AUTH_TOKEN` value the credential bridge swaps for your real Claude Code OAuth token. |
 
 Example:
