@@ -83,11 +83,11 @@ For the `/model` picker to list the DeepSeek models, Claude Code must run in gat
 
 ```bash
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 \
-ANTHROPIC_AUTH_TOKEN="$(sed -n 's/^sentinel:[[:space:]]*//p' ~/.deepseek-in-claude/config.yml)" \
+ANTHROPIC_AUTH_TOKEN="$(grep -m1 '^sentinel:' ~/.deepseek-in-claude/config.yml | cut -d: -f2- | tr -d " \"'")" \
 ANTHROPIC_BASE_URL=http://localhost:8016 claude
 ```
 
-`ANTHROPIC_AUTH_TOKEN` must match the sentinel the proxy expects exactly, or every Anthropic-model request answers 401 — hence reading it straight out of `config.yml`, where the installer wrote it. If you never ran the installer and have no `config.yml`, the value is `local-deepseek-proxy`.
+`ANTHROPIC_AUTH_TOKEN` must match the sentinel the proxy expects exactly, or every Anthropic-model request answers 401 — hence reading it straight out of `config.yml`, where the installer wrote it. If you never ran the installer and have no `config.yml`, the value is `local-deepseek-proxy`. `claudei.sh` does this for you, with the inline-comment handling the proxy's own YAML parser applies.
 
 You can also skip discovery entirely and name the model directly — this needs no auth env var at all, and your claude.ai login is untouched:
 
@@ -145,7 +145,7 @@ Because presenting the sentinel is what buys a request your OAuth token, it is n
 
 - Credentials are read from the store the CLI itself uses — the macOS keychain item `Claude Code-credentials`, or `~/.claude/.credentials.json` elsewhere. They are never logged and never leave your machine except to `api.anthropic.com`.
 - The store is read-only by default. When the access token expires, the proxy warns and Anthropic models 401 until something refreshes it — running `claude` normally does, and the proxy re-reads the store every 30s.
-- `--oauth-refresh` (or `oauthRefresh: true`) lets the proxy run the OAuth refresh grant itself and write the rotated token back. It is opt-in on purpose: this is the only path that writes to the credentials the real CLI depends on, and it has not been exercised against the live token endpoint — a bad rotation costs you a `/login`.
+- `--oauth-refresh` (or `oauthRefresh: true`) lets the proxy run the OAuth refresh grant itself and write the rotated token back. It is opt-in on purpose: this is the only path that writes to the credentials the real CLI depends on, and it has not been exercised against the live token endpoint — a bad rotation costs you a `/login`. On macOS the write also passes the credential blob to `security` as a command-line argument, so it is briefly visible to `ps`; both argv-free routes that CLI offers silently truncate a payload this size, and a partial write is the worse failure.
 - `--no-auth-bridge` (or `authBridge: false` in `config.yml`) turns the whole bridge off. In sentinel mode without it, Anthropic models 401.
 - `ANTHROPIC_AUTH_SENTINEL` changes the sentinel value the proxy accepts (`sentinel:` in `config.yml` wins over it). Change it on the proxy side only if you set `ANTHROPIC_AUTH_TOKEN` to the same value yourself — a mismatch 401s every Anthropic request.
 

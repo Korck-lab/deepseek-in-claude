@@ -136,7 +136,9 @@ function firstPort(...candidates) {
   for (const c of candidates) {
     if (c == null || c === "") continue;
     const n = Number(c);
-    if (Number.isInteger(n) && n >= 0 && n <= 65535) return n;
+    // 0 is a valid listen() argument but means "any free port", which nothing
+    // pointed at a fixed base URL could ever reach — reject it like any junk.
+    if (Number.isInteger(n) && n > 0 && n <= 65535) return n;
     console.error(`[config] ignoring invalid port value ${JSON.stringify(c)}`);
   }
   return 8016;
@@ -358,17 +360,12 @@ function warnOnce(message) {
   console.error(`[auth-bridge] ${message}`);
 }
 
-/** Run a command, optionally feeding it stdin. Returns stdout, or null on any
- * non-zero exit — every caller treats failure as "credential store unavailable"
- * and falls back, so the exit code itself carries no extra information. */
-const run = (cmd, args, stdin = null) =>
+/** Run a command. Returns stdout, or null on any non-zero exit — every caller
+ * treats failure as "credential store unavailable" and falls back, so the exit
+ * code itself carries no extra information. */
+const run = (cmd, args) =>
   new Promise((resolve) => {
-    const child = execFile(cmd, args, { encoding: "utf8" }, (err, stdout) => resolve(err ? null : stdout));
-    if (stdin == null) return;
-    child.stdin.on("error", () => {
-      /* command exited before reading stdin — the callback above reports it */
-    });
-    child.stdin.end(stdin);
+    execFile(cmd, args, { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 }, (err, stdout) => resolve(err ? null : stdout));
   });
 
 /** Read the CLI's credential store. Returns { creds, store } or null. */
@@ -397,12 +394,16 @@ async function writeCredentials(store, creds) {
   try {
     const raw = JSON.stringify(creds);
     if (store === "keychain") {
-      // `-w` with no value reads the password from stdin, prompting twice for
-      // confirmation — so the payload goes in as two lines. Passing it as an
-      // argv element instead would expose the access and refresh tokens to
-      // `ps` for the lifetime of the call. JSON.stringify escapes newlines, so
-      // the payload is always a single line and the two reads stay aligned.
-      await run("security", ["add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", os.userInfo().username, "-w"], `${raw}\n${raw}\n`);
+      // The payload goes in as an argv element, so it is visible to `ps` for
+      // the lifetime of the call — one more reason refreshing is opt-in. Both
+      // argv-free routes the `security` CLI offers were measured and silently
+      // truncate a real credential blob (~22KB here): `-w` with no value reads
+      // through getpass and caps at 128 bytes, and `security -i` caps its
+      // command line near 4KB, storing a prefix and reporting the rest as an
+      // unknown command. A partial write costs the user a `/login`, which is
+      // worse than the exposure, so argv stands until there is a route that
+      // does not truncate.
+      await run("security", ["add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", os.userInfo().username, "-w", raw]);
       return;
     }
     fs.writeFileSync(CREDENTIALS_FILE, raw, { mode: 0o600 });

@@ -13,14 +13,21 @@ echo "   proxy source: $PROXY_HOME (version $(cat "$PROXY_HOME/VERSION" 2>/dev/n
 # updated checkout is invisible until the process is replaced. Fingerprint the
 # file at launch and restart on mismatch — otherwise the reuse path below
 # silently serves stale model ids (and thus a stale context window).
+#
+# config.yml is in the fingerprint too: every key in it (port, redir, fallback,
+# effort, authBridge, sentinel) is read once at proxy startup. The sentinel is
+# the sharp case — the installer writing a new one while a proxy is already
+# running would leave the launcher exporting a value the old process doesn't
+# recognise, and every Anthropic-model request would 401 while DeepSeek models
+# kept working.
 STAMP=/tmp/deepseek-proxy.sha
-SHA="$(shasum "$PROXY_HOME/proxy.mjs" 2>/dev/null | cut -d' ' -f1)"
+SHA="$(cat "$PROXY_HOME/proxy.mjs" "$PROXY_HOME/config.yml" 2>/dev/null | shasum | cut -d' ' -f1)"
 
 if lsof -ti :$PORT >/dev/null 2>&1 && [ "$SHA" = "$(cat "$STAMP" 2>/dev/null)" ]; then
   echo "   proxy already running, reusing"
 else
   if lsof -ti :$PORT >/dev/null 2>&1; then
-    echo "   proxy.mjs changed since launch, restarting"
+    echo "   proxy.mjs or config.yml changed since launch, restarting"
     lsof -ti :$PORT | xargs kill 2>/dev/null || true
     sleep 1
   fi
