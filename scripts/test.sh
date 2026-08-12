@@ -235,6 +235,13 @@ if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8004 --
   check "T14 response echoes the display id, not the DeepSeek id" 'echo "$W1" | grep -q "\"model\":\"claude-deepseek-v4-flash\[1m\]\""'
   check "T14b the real id is gone from the response body" '! echo "$W1" | grep -q "\"model\":\"deepseek-v4-flash\""'
   check "T14c the request still carried the real id" 'echo "$W1" | grep -q "ROUTED:deepseek-v4-flash"'
+
+  # Claude Code strips [1m] before dispatching, so this is the shape the proxy
+  # actually sees in production. Echoing back what arrived would drop the suffix
+  # from the transcript and cost the resumed session its 1M window, so the
+  # response carries the canonical display id regardless of what was asked.
+  W3="$(curl -s --max-time 5 -X POST http://localhost:8004/v1/messages -H "content-type: application/json" -d '{"model":"claude-deepseek-v4-flash","messages":[{"role":"user","content":"x"}]}')"
+  check "T14d suffix-less request still answers with the [1m] display id" 'echo "$W3" | grep -q "\"model\":\"claude-deepseek-v4-flash\[1m\]\""'
 else
   echo "FAIL T7 could not start proxy with mock upstream"
 fi

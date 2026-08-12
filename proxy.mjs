@@ -788,8 +788,14 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
   try {
     const reqJson = JSON.parse(body.toString("utf8"));
     let changed = false;
-    clientModel = typeof reqJson?.model === "string" ? reqJson.model : null;
     const real = reqJson?.model ? deepseekRealId(reqJson.model) : null;
+    // The *canonical* display id, not the string the client happened to send.
+    // Claude Code strips `[1m]` before dispatching, so echoing back what it sent
+    // would put a suffix-less id in the transcript — and a resumed session reads
+    // its window from that id, landing on the assumed 200k instead of DeepSeek's
+    // real 1M. Answering with the id the picker itself lists is both truthful
+    // and what keeps the window right across a reconnect.
+    clientModel = real ? displayIdOf(real) : (typeof reqJson?.model === "string" ? reqJson.model : null);
     if (real && reqJson.model !== real) {
       reqJson.model = real;
       changed = true;
