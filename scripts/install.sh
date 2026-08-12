@@ -99,6 +99,37 @@ else
   echo "warning: no terminal — key prompt skipped. Add DEEPSEEK_API_KEY to $ENV_FILE later." >&2
 fi
 
+# --- auth sentinel ----------------------------------------------------------
+# The sentinel is the ANTHROPIC_AUTH_TOKEN value the proxy swaps for the real
+# Claude Code OAuth token. A published constant means anyone who can reach the
+# proxy can spend that token, so generate a per-install random value instead.
+# config.yml is the single source of truth: the proxy reads it, and claudei.sh
+# reads it back out to hand Claude Code the matching value. Written only when
+# absent — never overwrite a sentinel already in use.
+CFG_FILE="$DEST/config.yml"
+
+if [ ! -f "$CFG_FILE" ]; then
+  # Deliberately minimal, not a copy of config.example.yml — that file enables
+  # the redir map, which would silently reroute Anthropic models to DeepSeek.
+  printf '# deepseek-in-claude proxy config. See config.example.yml for every option.\n' > "$CFG_FILE"
+fi
+
+if ! grep -q '^sentinel:' "$CFG_FILE"; then
+  # Append-safe even if the existing file lacks a trailing newline. Written as an
+  # `if` rather than a `&&` chain because under `set -e` a false test at the end
+  # of a chain would abort the installer, and a file already ending in a newline
+  # is the normal case, not a failure.
+  if [ -s "$CFG_FILE" ] && [ -n "$(tail -c 1 "$CFG_FILE")" ]; then printf '\n' >> "$CFG_FILE"; fi
+  if command -v openssl >/dev/null 2>&1; then
+    RAND="$(openssl rand -hex 16)"
+  else
+    RAND="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  fi
+  printf 'sentinel: local-deepseek-proxy-%s\n' "$RAND" >> "$CFG_FILE"
+  chmod 600 "$CFG_FILE"
+  echo "==> generated a per-install auth sentinel in $CFG_FILE"
+fi
+
 echo "==> done"
 echo "    start:   node $DEST/proxy.mjs"
 echo "    connect: ANTHROPIC_BASE_URL=http://localhost:8016 claude"

@@ -36,6 +36,11 @@ effort:
 # claude.ai login on every request. The proxy swaps this exact sentinel for your
 # real Claude Code OAuth token on the Anthropic leg. Set false (or pass
 # --no-auth-bridge) to disable — Anthropic models then answer 401 in sentinel mode.
+#
+# scripts/install.sh writes a random per-install sentinel into config.yml, and
+# claudei.sh reads it back from there — config.yml is the single source of truth,
+# because a launcher and proxy that disagree 401 every Anthropic request. Set it
+# by hand only if you also set ANTHROPIC_AUTH_TOKEN to the same value yourself.
 authBridge: true
 sentinel: local-deepseek-proxy
 

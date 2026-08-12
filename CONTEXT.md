@@ -35,7 +35,7 @@ URL and populates the `/model` picker. Only runs when an auth env var is set.
 Disable with `--no-auth-bridge`. Not to be called "auth passthrough" — passthrough is
 what happens to a *real* credential, the bridge is a swap.
 
-**Sentinel** — the placeholder auth value (`local-deepseek-proxy`) Claude Code is given.
+**Sentinel** — the placeholder auth value Claude Code is given. Random per install, stored as `sentinel:` in `config.yml` (the single source of truth for both the proxy and `claudei.sh`); falls back to `local-deepseek-proxy` when that file is absent.
 It is not a credential and never leaves the proxy.
 
 **Redir** — the `--redir` mode that routes Anthropic-family model names

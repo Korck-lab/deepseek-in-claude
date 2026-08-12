@@ -40,8 +40,17 @@ echo "🚀 Starting claude code irrestrict..."
 # gateway model discovery (what puts DeepSeek in the /model picker) when an auth
 # env var is set, and the proxy swaps this exact value for your real Claude Code
 # OAuth token on the Anthropic leg.
+#
+# The value must match what the proxy expects exactly or every Anthropic-model
+# request 401s, so both sides read it from the same config.yml. install.sh
+# writes a per-install random value there; if the key is absent, both fall back
+# to the historical literal. Parsing mirrors the proxy's YAML subset: strip an
+# inline comment (whitespace + #) and surrounding quotes.
+SENTINEL="$(sed -n 's/^sentinel:[[:space:]]*//p' "$PROXY_HOME/config.yml" 2>/dev/null \
+  | head -n 1 | sed 's/[[:space:]][[:space:]]*#.*$//' | tr -d "\"'" | tr -d '[:space:]')"
+
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 \
-ANTHROPIC_AUTH_TOKEN="${ANTHROPIC_AUTH_TOKEN:-local-deepseek-proxy}" \
+ANTHROPIC_AUTH_TOKEN="${ANTHROPIC_AUTH_TOKEN:-${SENTINEL:-local-deepseek-proxy}}" \
 ANTHROPIC_BASE_URL=http://localhost:$PORT claude --dangerously-skip-permissions \
    --append-system-prompt "Be terse while keep information density. Forward terseness instruction to all sub-agents" \
    "$@"
