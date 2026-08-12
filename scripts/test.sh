@@ -133,7 +133,7 @@ fi
 # its own fixtures, but invoked from here so they cannot rot unnoticed — nobody
 # runs a suite they have to know the name of.
 echo "==> unit and race suites"
-for suite in test-parsing test-model-race test-auth-bridge; do
+for suite in test-parsing test-model-race test-auth-bridge test-session-pool; do
   if bash "$HERE_SCRIPTS/$suite.sh" >"$TMP/$suite.out" 2>&1; then
     PASS=$((PASS + 1)); echo "PASS  $suite"
   else
@@ -224,6 +224,17 @@ if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8004 --
 
   W2="$(curl -s --max-time 5 -X POST http://localhost:8004/v1/messages -H "content-type: application/json" -d '{"model":"claude-deepseek-v4-pro","messages":[{"role":"user","content":"x"}]}')"
   check "T13b bare display id still routes" 'echo "$W2" | grep -q "ROUTED:deepseek-v4-pro"'
+
+  # The request goes out as the real id (T13) and the response must come back as
+  # the display id. Claude Code restores a resumed session's model from the
+  # `model` of the last assistant message in the transcript, so an unrewritten
+  # `deepseek-v4-flash` there is an id it cannot resolve: it declines the restore
+  # and falls back to one without `[1m]`, dropping the session to an assumed 200k
+  # window. The mock echoes whatever model it received into message_start, so
+  # `ROUTED:` proves what was sent and `"model":` proves what came back.
+  check "T14 response echoes the display id, not the DeepSeek id" 'echo "$W1" | grep -q "\"model\":\"claude-deepseek-v4-flash\[1m\]\""'
+  check "T14b the real id is gone from the response body" '! echo "$W1" | grep -q "\"model\":\"deepseek-v4-flash\""'
+  check "T14c the request still carried the real id" 'echo "$W1" | grep -q "ROUTED:deepseek-v4-flash"'
 else
   echo "FAIL T7 could not start proxy with mock upstream"
 fi

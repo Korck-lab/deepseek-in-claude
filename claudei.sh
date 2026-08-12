@@ -20,6 +20,42 @@ STAMP="$STATE_DIR/proxy.sha"
 PIDFILE="$STATE_DIR/proxy.pid"
 PROXY_LOG="$STATE_DIR/proxy.log"
 
+# One proxy serves every concurrent session, so the last one out turns off the
+# lights — not the first. Each launcher registers itself as a file named for its
+# pid and removes it on the way out; the proxy is stopped only when none remain.
+#
+# A directory of pid-named files rather than a counter: incrementing a shared
+# integer needs a lock to be safe against two launchers starting at once, while
+# a create and an unlink are already atomic. It is also self-healing — a session
+# killed with SIGKILL leaves its file behind, and the check below drops any entry
+# whose process is gone rather than pinning the proxy open forever.
+SESSION_DIR="$STATE_DIR/sessions"
+mkdir -p "$SESSION_DIR"
+SESSION_FILE="$SESSION_DIR/$$"
+
+# Live registrations, stale ones pruned. Echoes one pid per line; callers count.
+live_sessions() {
+  local f pid
+  for f in "$SESSION_DIR"/*; do
+    [ -e "$f" ] || continue          # no glob match — the directory is empty
+    pid="${f##*/}"
+    case "$pid" in "" | *[!0-9]*) rm -f "$f"; continue ;; esac
+    if kill -0 "$pid" 2>/dev/null; then printf '%s\n' "$pid"; else rm -f "$f"; fi
+  done
+}
+
+# How many *other* launchers hold the proxy. Excludes this one explicitly rather
+# than relying on the lease not being taken yet, so it reads the same before the
+# lease, after it, and after the lease is released on exit.
+other_sessions() {
+  live_sessions | grep -vx "$$" | wc -l | tr -d ' '
+}
+
+# Taken before the proxy block so two launchers starting at once each see the
+# other. The lease means "this session wants the proxy alive", not "this session
+# started it" — whoever actually starts it is irrelevant to when it may stop.
+: >"$SESSION_FILE"
+
 # --- proxy lifecycle ---------------------------------------------------------
 
 # True only for a live process that is still this proxy. Pids get recycled, so
@@ -65,6 +101,16 @@ stop_proxy() {
 # aimed at this script, which bash defers until `claude` exits but still
 # honours. Only SIGKILL escapes it; the next launch reclaims that proxy by port.
 on_exit() {
+  # Release this session's lease first, so the count below is of *other*
+  # sessions. Done unconditionally: an exit before the lease was taken leaves
+  # nothing to remove, and rm -f is happy either way.
+  rm -f "$SESSION_FILE"
+  local others
+  others="$(live_sessions | wc -l | tr -d ' ')"
+  if [ "$others" -gt 0 ]; then
+    echo "🚀 Leaving proxy on :$PORT running for $others other session(s)"
+    return
+  fi
   echo "🚀 Stopping proxy on :$PORT ..."
   stop_proxy
 }
@@ -117,10 +163,26 @@ fi
 if RUNNING_PID="$(proxy_pid)" && [ "$SHA" = "$(cat "$STAMP" 2>/dev/null)" ]; then
   echo "   proxy already running (pid $RUNNING_PID), reusing"
 else
+  # Restarting is right for a stale proxy and wrong for a shared one: another
+  # session is streaming through it, and killing it drops that connection
+  # mid-response. The new code is what this session wanted; a live session's
+  # traffic is what it must not break. Reuse and say why — and skip the start
+  # below, or it would race a second proxy onto a port that is already held.
+  SHARED=0
   if proxy_pid >/dev/null; then
-    echo "   proxy.mjs or config.yml changed since launch, restarting"
-    stop_proxy
+    OTHERS="$(other_sessions)"
+    if [ "$OTHERS" -gt 0 ]; then
+      echo "   proxy.mjs or config.yml changed, but $OTHERS other session(s) are using the proxy — reusing the running one"
+      echo "   (close them and rerun to pick up the change)"
+      SHARED=1
+    else
+      echo "   proxy.mjs or config.yml changed since launch, restarting"
+      stop_proxy
+    fi
   fi
+fi
+
+if [ "${SHARED:-0}" = "0" ] && ! proxy_pid >/dev/null; then
   # The log can carry request paths and upstream error text, so create it 0600
   # before anything writes to it rather than inheriting the ambient umask.
   : >"$PROXY_LOG" && chmod 600 "$PROXY_LOG"

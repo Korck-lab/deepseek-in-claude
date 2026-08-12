@@ -782,9 +782,13 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
   }
 
   let forwardedBody = body;
+  // The id the client asked for, kept so the response can be answered in the
+  // same vocabulary it was asked in. See restoreClientModel below.
+  let clientModel = null;
   try {
     const reqJson = JSON.parse(body.toString("utf8"));
     let changed = false;
+    clientModel = typeof reqJson?.model === "string" ? reqJson.model : null;
     const real = reqJson?.model ? deepseekRealId(reqJson.model) : null;
     if (real && reqJson.model !== real) {
       reqJson.model = real;
@@ -863,8 +867,31 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
         if (status === 200) {
           res.writeHead(status, cleanResponseHeaders(up.headers));
           const respChunks = [];
-          up.on("data", (c) => { respChunks.push(c); res.write(c); });
+          // `model` lives in the first SSE event (message_start), so hold bytes
+          // only until that event is complete, rewrite it, and stream the rest
+          // straight through. Holding the whole response would break streaming;
+          // rewriting each chunk blind would miss a field split across a chunk
+          // boundary.
+          let head = sentModel === clientModel ? null : Buffer.alloc(0);
+          up.on("data", (c) => {
+            respChunks.push(c);
+            if (head === null) { res.write(c); return; }
+            head = Buffer.concat([head, c]);
+            const text = head.toString("utf8");
+            const end = text.indexOf("\n\n");
+            // Cap the hold: a stream that never presents a complete event must
+            // not be buffered indefinitely waiting for one.
+            if (end === -1 && head.length < 65536) return;
+            res.write(Buffer.from(restoreClientModel(text, clientModel, sentModel), "utf8"));
+            head = null;
+          });
           up.on("end", () => {
+            // A response that ended before its first event boundary — short,
+            // non-SSE, or truncated — still has to reach the client.
+            if (head !== null && head.length > 0) {
+              res.write(Buffer.from(restoreClientModel(head.toString("utf8"), clientModel, sentModel), "utf8"));
+            }
+            head = null;
             clearUpstreamTimeout();
             res.end();
             logUsage({ method: req.method, path: reqPath, status, ms: Date.now() - started, model: sentModel, usage: decodeSse(Buffer.concat(respChunks).toString("utf8")) });
@@ -991,6 +1018,30 @@ async function serveModels(req, res) {
 // ---------------------------------------------------------------------------
 // Anthropic forward
 // ---------------------------------------------------------------------------
+
+/** Answer in the vocabulary the client asked in: put the display id back into the
+ * response's `model` field, replacing the real DeepSeek id the upstream echoes.
+ *
+ * Not cosmetic. Claude Code restores a resumed session's model by reading the
+ * `model` of the last *assistant message in the transcript* — what the response
+ * reported — not what the picker had selected. An unrewritten `deepseek-v4-flash`
+ * is an id it cannot resolve, so it declines the restore and falls back to an id
+ * without the `[1m]` marker, silently dropping the session from a 1M window to
+ * the assumed 200k. The symptom is "Session model deepseek-v4-flash could not be
+ * restored", one reconnect later and far from this line.
+ *
+ * Only the first `message_start` event carries the field, so the stream is
+ * buffered no further than the end of that event, then written through untouched.
+ */
+function restoreClientModel(text, clientModel, realModel) {
+  if (!clientModel || !realModel || clientModel === realModel) return text;
+  // Anchored on the JSON field so a model name appearing in prose — a user asking
+  // about "deepseek-v4-flash", say — is never rewritten.
+  return text.replace(
+    new RegExp(`("model"\\s*:\\s*)"${realModel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`, "g"),
+    `$1${JSON.stringify(clientModel)}`
+  );
+}
 
 function rewriteModel(body, model) {
   try {
