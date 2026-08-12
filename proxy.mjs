@@ -69,7 +69,14 @@ function loadYaml(text) {
     // to the default with no diagnostic.
     const m = trimmed.match(/^"([^"]+)":\s*(.*)$/) ?? trimmed.match(/^'([^']+)':\s*(.*)$/) ?? trimmed.match(/^([A-Za-z0-9_.-]+):\s*(.*)$/);
     if (!m) {
-      console.error(`[config] ignoring unparsable line in ${CONFIG_PATH}: ${trimmed.slice(0, 60)}`);
+      // Sequences and document markers are valid YAML this subset deliberately
+      // doesn't support; warning about them would put a line on stderr at every
+      // start for a config that is perfectly fine. Anything else reaching here
+      // is a line the user meant as a setting and won't get — a missing colon,
+      // a block scalar — so it is worth naming.
+      if (!trimmed.startsWith("- ") && trimmed !== "-" && trimmed !== "---" && trimmed !== "...") {
+        console.error(`[config] ignoring unparsable line in ${CONFIG_PATH}: ${trimmed.slice(0, 60)}`);
+      }
       continue;
     }
     while (stack.length > 1 && indent <= stack[stack.length - 1].indent) stack.pop();

@@ -44,6 +44,21 @@ eq("quoted key and value", loadYaml('"sentinel": "abc"').sentinel, "abc");
 eq("booleans unaffected", loadYaml("fallback: false").fallback, false);
 eq("inline comment stripped", loadYaml("port: 8016  # listen here").port, 8016);
 
+console.log("-- loadYaml: warn on broken settings, stay quiet on unsupported YAML --");
+const warnings = (text) => {
+  const errs = [];
+  const orig = console.error;
+  console.error = (m) => errs.push(m);
+  try { loadYaml(text); } finally { console.error = orig; }
+  return errs.length;
+};
+eq("sequence is quiet", warnings("redir:\n  - haiku\n  - sonnet\n"), 0);
+eq("sequence of maps is quiet", warnings("tools:\n  - name: a\n"), 0);
+eq("document markers are quiet", warnings("---\nport: 8016\n...\n"), 0);
+eq("valid config is quiet", warnings("port: 8016\nredir:\n  haiku: deepseek-v4-flash\n"), 0);
+eq("missing colon warns", warnings("port 8016\n") > 0, true);
+eq("unsupported block scalar warns", warnings("note: |\n  some text\n") > 0, true);
+
 console.log("-- familyOf: segment match, not substring --");
 eq("claude-sonnet-4-5", familyOf("claude-sonnet-4-5"), "sonnet");
 eq("claude-opus-5", familyOf("claude-opus-5"), "opus");
