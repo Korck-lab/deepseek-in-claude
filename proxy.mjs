@@ -349,6 +349,7 @@ const CRED_CACHE_TTL = 30 * 1000;
 const CRED_EXPIRY_MARGIN = 60 * 1000;
 
 let credCache = { at: 0, token: null };
+let credInFlight = null;
 // Keyed per message: a single flag would let the first warning ever printed
 // swallow every later one, including the "run `claude` to re-authenticate" hint.
 const credWarned = new Set();
@@ -456,9 +457,24 @@ async function refreshOauthOnce(creds, store) {
   return creds.claudeAiOauth.accessToken;
 }
 
-/** The user's current Claude Code OAuth access token, or null. */
+/** The user's current Claude Code OAuth access token, or null.
+ *
+ * Serialised the same way as the model list, and for a sharper reason: a cache
+ * miss shells out to `security`, so a burst of requests would spawn one
+ * keychain process each. Worse, each of those can decide the token is expired
+ * and enter the refresh path — refreshOauth() already collapses the grant
+ * itself, but only after the work of getting there has been duplicated. */
 async function anthropicAccessToken() {
   if (credCache.token && Date.now() - credCache.at < CRED_CACHE_TTL) return credCache.token;
+  if (!credInFlight) {
+    credInFlight = anthropicAccessTokenOnce().finally(() => {
+      credInFlight = null;
+    });
+  }
+  return credInFlight;
+}
+
+async function anthropicAccessTokenOnce() {
   const found = await readCredentials();
   if (!found) {
     warnOnce("no Claude Code credentials found — Anthropic models will not authenticate");
@@ -513,6 +529,7 @@ async function applyAnthropicAuth(headers) {
 
 const MODEL_CACHE_TTL = 10 * 60 * 1000;
 let dsModelsCache = { at: 0, models: null };
+let dsModelsInFlight = null;
 
 // Real DeepSeek model ids this proxy will route to upstream.
 let deepseekIds = new Set(DEFAULT_MODELS);
@@ -551,8 +568,25 @@ function toModelEntry(id, created) {
   };
 }
 
+/** The DeepSeek model list, cached for MODEL_CACHE_TTL.
+ *
+ * Serialised through a single in-flight promise: the TTL check and the cache
+ * write are far apart (a network round trip), so concurrent callers would all
+ * see an empty cache, all fetch, and all clobber `deepseekIds` /
+ * `displayToReal` in whatever order they happened to finish. Claude Code opens
+ * several /v1/models requests at once at startup, so this is the common path,
+ * not an edge case. */
 async function deepseekModelList() {
   if (dsModelsCache.models && Date.now() - dsModelsCache.at < MODEL_CACHE_TTL) return dsModelsCache.models;
+  if (!dsModelsInFlight) {
+    dsModelsInFlight = fetchDeepseekModelList().finally(() => {
+      dsModelsInFlight = null;
+    });
+  }
+  return dsModelsInFlight;
+}
+
+async function fetchDeepseekModelList() {
   const models = new Map();
   for (const id of DEFAULT_MODELS) models.set(id, toModelEntry(id, 0));
   if (DEEPSEEK_API_KEY) {
