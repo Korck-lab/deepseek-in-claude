@@ -117,3 +117,87 @@ the context-size problem (cache tokens dominate) is invisible.
 - Fix hypothesis proven: dropping `advisor_20260301` → 200 with real usage.
 - DeepSeek param surface (max_tokens/thinking/effort/context) fully tolerant — only tool
   schema is the incompatibility.
+
+---
+
+# Model discovery, context window, and auth — Claude Code 2.1.228
+
+Date: 2026-08-11. Method: decompiled string/code extraction from the `claude` binary
+(2.1.228) plus a sniffing proxy in front of `api.anthropic.com` running real `claude -p`
+calls. Every claim below is either quoted from the binary or reproduced by a sniffer run.
+
+## 1. Gateway model discovery
+
+```js
+eTs()  // discovery enabled?
+  requires CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY, provider === "firstParty",
+           a non-Anthropic ANTHROPIC_BASE_URL
+$vu()  // the fetch
+  GET ${ANTHROPIC_BASE_URL}/v1/models?limit=1000
+  auth: Authorization: Bearer $ANTHROPIC_AUTH_TOKEN, else x-api-key: <api key>
+  if neither is present it returns early — no fetch at all
+  schema: { id: string, display_name?: string }  (.strip() — extra fields discarded)
+  filter: /(claude|anthropic)/i.test(model.id)
+  cache:  ~/.claude/cache/gateway-models.json, keyed by baseUrl
+picker entry: { value: id, label: display_name || id, description: "From gateway" }
+```
+
+Consequences:
+
+- The id filter is why DeepSeek models are served as `claude-deepseek-*`.
+- The schema is stripped, so a proxy cannot ship context-window metadata with a model.
+- Discovery only *appends*. Claude Code's own bundled catalog rows (Opus 4.7, Sonnet 4.6, …)
+  are not affected by anything the proxy returns.
+- `CLAUDE_CODE_USE_GATEWAY=1` makes `Vn()` return `"gateway"` instead of `"firstParty"`,
+  which fails the `eTs()` precondition — it *disables* discovery.
+
+## 2. Context window for an unknown model
+
+```js
+hEu(model) {
+  if (/\[1m\]/i.test(model)) return 1_000_000;      // no catalog lookup
+  ...
+  const n = CLAUDE_CODE_MAX_CONTEXT_TOKENS;
+  if (n > 0 && !model.startsWith("claude-")) return n;
+  return 200_000;
+}
+```
+
+- `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is skipped for every id starting with `claude-` — which
+  the discovery filter forces on us. The two mechanisms are mutually exclusive.
+- The `[1m]` marker is a pure regex test, so it works for a model Claude Code has never
+  heard of. It also makes `W6()` skip the `unknown-model` branch, suppressing the
+  "not a model this version recognizes" notice.
+- `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1` only changes the window
+  *source* label. The assumed window stays 200k.
+- `--autocompact N` (settings branch of `W6`) wins over everything: with `--autocompact 350k`
+  a 1M model reports 350k.
+
+Verified: `claude -p "/context" --model 'claude-deepseek-v4-flash[1m]'` reports
+**57.2k / 1m (6%)**.
+
+## 3. Auth: discovery vs. your claude.ai login
+
+Three sniffer runs, same `claude -p` invocation, only the auth env var changed:
+
+| Env | `/v1/models` fetched | `/v1/messages` |
+| --- | --- | --- |
+| `ANTHROPIC_AUTH_TOKEN=<sentinel>` | yes (`Bearer <sentinel>`) | **401 Invalid bearer token** |
+| none (subscription OAuth) | no — discovery skipped | 200 (`Bearer sk-ant-oat01-…`) |
+| `ANTHROPIC_API_KEY=<bogus>` | yes (`x-api-key`) | 401 — the key overrides the login too |
+
+So discovery needs an auth env var, and any auth env var takes precedence over the
+claude.ai login for every request. The proxy's credential bridge closes the gap: it swaps
+the sentinel for the CLI's own OAuth access token and appends the `oauth-2025-04-20` beta.
+Verified end-to-end — with the bridge, `/v1/models` returns the real 12-model merged list
+and `--model claude-opus-5` answers 200 in the same session that reaches DeepSeek.
+
+Scope of that verification: the **swap** is proven. The **refresh grant is not** — probing it
+with a deliberately invalid refresh token returned `429 rate_limit_error`, so the accepted
+content-type was never established and no successful rotation has ever run. That is why
+`--oauth-refresh` is opt-in and the proxy is read-only by default: the grant rotates the
+refresh token, and a mis-persisted rotation would break the real CLI's own sessions.
+
+OAuth constants used by the refresh grant (from the binary):
+`TOKEN_URL=https://platform.claude.com/v1/oauth/token`,
+`CLIENT_ID=9d1c250a-e61b-44d9-88ed-5944d1962f5e`.

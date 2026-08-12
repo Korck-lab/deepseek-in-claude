@@ -23,7 +23,9 @@
 import http from "node:http";
 import https from "node:https";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -35,7 +37,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FALLBACK_STATUS = new Set([404, 429, 500, 501, 502, 503, 504]);
 
 function parseArgs(argv) {
-  const out = { port: null, redir: false, fallback: null, config: null, debug: false, help: false };
+  const out = { port: null, redir: false, fallback: null, config: null, debug: false, help: false, noAuthBridge: false, oauthRefresh: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--port") out.port = Number(argv[++i]);
@@ -43,6 +45,8 @@ function parseArgs(argv) {
     else if (a === "--fallback") out.fallback = true;
     else if (a === "--config") out.config = argv[++i];
     else if (a === "--debug") out.debug = true;
+    else if (a === "--no-auth-bridge") out.noAuthBridge = true;
+    else if (a === "--oauth-refresh") out.oauthRefresh = true;
     else if (a === "--help" || a === "-h") out.help = true;
   }
   return out;
@@ -86,6 +90,12 @@ Usage: node proxy.mjs [options]
                     same redir relation, both directions
   --config PATH     YAML config file (default ./config.yml)
   --debug           log every request/response to /tmp/deepseek-proxy-payloads.jsonl
+  --no-auth-bridge  do not substitute your Claude Code OAuth token for the
+                    ANTHROPIC_AUTH_TOKEN sentinel on the Anthropic leg
+                    (Anthropic models then answer 401 in sentinel mode)
+  --oauth-refresh   allow the proxy to run the OAuth refresh grant and write the
+                    rotated token back to your credential store when it expires
+                    (off by default; without it an expired token just warns)
   --help            show this help
 
 Config precedence: CLI args > config.yml > .env > defaults.`);
@@ -281,6 +291,190 @@ function sendError(res, status, type, message) {
 }
 
 // ---------------------------------------------------------------------------
+// Anthropic credential bridge
+//
+// Claude Code only performs gateway model discovery — the thing that puts
+// DeepSeek in the `/model` picker — when ANTHROPIC_AUTH_TOKEN (or an API key)
+// is set. But that same credential then takes precedence over the claude.ai
+// login for *every* request, so a placeholder value makes real Anthropic models
+// answer 401.
+//
+// The bridge resolves that: Claude Code is given a sentinel token, and requests
+// arriving with exactly that sentinel get the user's real Claude Code OAuth
+// access token substituted on the Anthropic leg (plus the `oauth-2025-04-20`
+// beta the OAuth path requires). Any other Authorization value is passed
+// through untouched. Credentials are read from the same store the CLI uses —
+// the macOS keychain, or ~/.claude/.credentials.json elsewhere — read-only
+// unless --oauth-refresh is passed, in which case an expired token is renewed
+// through the OAuth refresh grant and written back.
+// ---------------------------------------------------------------------------
+
+const AUTH_BRIDGE = ARGS.noAuthBridge ? false : CFG.authBridge !== false;
+const AUTH_SENTINEL = CFG.sentinel ?? process.env.ANTHROPIC_AUTH_SENTINEL ?? "local-deepseek-proxy";
+// Refreshing is the only thing here that *writes* to the credential store the
+// real CLI depends on, so it is opt-in: a botched rotation would force the user
+// to `/login` again. Left off, an expired token simply warns and 401s, and any
+// normal `claude` session refreshes the store for us within CRED_CACHE_TTL.
+const OAUTH_REFRESH = ARGS.oauthRefresh === true || CFG.oauthRefresh === true;
+const OAUTH_BETA = "oauth-2025-04-20";
+const OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
+const OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const KEYCHAIN_SERVICE = "Claude Code-credentials";
+const CREDENTIALS_FILE = path.join(os.homedir(), ".claude", ".credentials.json");
+const CRED_CACHE_TTL = 30 * 1000;
+// Refresh a little before the deadline so an in-flight request can't age out.
+const CRED_EXPIRY_MARGIN = 60 * 1000;
+
+let credCache = { at: 0, token: null };
+// Keyed per message: a single flag would let the first warning ever printed
+// swallow every later one, including the "run `claude` to re-authenticate" hint.
+const credWarned = new Set();
+let refreshInFlight = null;
+
+function warnOnce(message) {
+  if (credWarned.has(message)) return;
+  credWarned.add(message);
+  console.error(`[auth-bridge] ${message}`);
+}
+
+const run = (cmd, args) =>
+  new Promise((resolve) => {
+    execFile(cmd, args, { encoding: "utf8" }, (err, stdout) => resolve(err ? null : stdout));
+  });
+
+/** Read the CLI's credential store. Returns { creds, store } or null. */
+async function readCredentials() {
+  if (process.platform === "darwin") {
+    const raw = await run("security", ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"]);
+    if (raw) {
+      try {
+        return { creds: JSON.parse(raw), store: "keychain" };
+      } catch {
+        /* corrupt keychain item — try the file next */
+      }
+    }
+  }
+  try {
+    return { creds: JSON.parse(fs.readFileSync(CREDENTIALS_FILE, "utf8")), store: "file" };
+  } catch {
+    return null;
+  }
+}
+
+/** Persist rotated tokens so normal `claude` sessions keep working. Never
+ * throws: a token we hold is still usable in memory even if the store rejects
+ * it, and losing it over a failed write would 401 a request that could succeed.
+ * Note the keychain path passes the payload in argv, so it is briefly visible
+ * to `ps` — one more reason refreshing is opt-in. */
+async function writeCredentials(store, creds) {
+  try {
+    const raw = JSON.stringify(creds);
+    if (store === "keychain") {
+      await run("security", ["add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", os.userInfo().username, "-w", raw]);
+      return;
+    }
+    fs.writeFileSync(CREDENTIALS_FILE, raw, { mode: 0o600 });
+  } catch (err) {
+    warnOnce(`could not persist the refreshed token: ${err.message}`);
+  }
+}
+
+/** Exchange the refresh token for a fresh access token. Serialised through a
+ * single in-flight promise: refresh tokens rotate, so two concurrent grants
+ * would spend the same one twice and race to write the loser's result back. */
+function refreshOauth(creds, store) {
+  if (!refreshInFlight) {
+    refreshInFlight = refreshOauthOnce(creds, store).finally(() => {
+      refreshInFlight = null;
+    });
+  }
+  return refreshInFlight;
+}
+
+async function refreshOauthOnce(creds, store) {
+  const oauth = creds?.claudeAiOauth;
+  if (!oauth?.refreshToken) return null;
+  const grant = { grant_type: "refresh_token", refresh_token: oauth.refreshToken, client_id: OAUTH_CLIENT_ID };
+  // The token endpoint is documented for both encodings; try JSON, then form.
+  const encodings = [
+    { "content-type": "application/json", body: JSON.stringify(grant) },
+    { "content-type": "application/x-www-form-urlencoded", body: new URLSearchParams(grant).toString() },
+  ];
+  let json = null;
+  for (const enc of encodings) {
+    const res = await fetchJson(OAUTH_TOKEN_URL, {
+      method: "POST",
+      headers: { "content-type": enc["content-type"], accept: "application/json" },
+      body: enc.body,
+    }).catch(() => ({ status: 0, json: null }));
+    if (res.status === 200 && res.json?.access_token) {
+      json = res.json;
+      break;
+    }
+  }
+  if (!json) return null;
+  creds.claudeAiOauth = {
+    ...oauth,
+    accessToken: json.access_token,
+    refreshToken: json.refresh_token ?? oauth.refreshToken,
+    expiresAt: Date.now() + Number(json.expires_in ?? 0) * 1000,
+  };
+  await writeCredentials(store, creds);
+  return creds.claudeAiOauth.accessToken;
+}
+
+/** The user's current Claude Code OAuth access token, or null. */
+async function anthropicAccessToken() {
+  if (credCache.token && Date.now() - credCache.at < CRED_CACHE_TTL) return credCache.token;
+  const found = await readCredentials();
+  if (!found) {
+    warnOnce("no Claude Code credentials found — Anthropic models will not authenticate");
+    return null;
+  }
+  const oauth = found.creds?.claudeAiOauth;
+  if (!oauth?.accessToken) {
+    warnOnce("credential store has no claude.ai OAuth token — run `claude` and log in");
+    return null;
+  }
+  let token = oauth.accessToken;
+  if (typeof oauth.expiresAt === "number" && oauth.expiresAt - CRED_EXPIRY_MARGIN <= Date.now()) {
+    if (!OAUTH_REFRESH) {
+      warnOnce("OAuth token expired — run `claude` once to refresh it, or start the proxy with --oauth-refresh");
+      return null;
+    }
+    token = await refreshOauth(found.creds, found.store);
+    if (!token) {
+      warnOnce("OAuth token expired and refresh failed — run `claude` once to re-authenticate");
+      return null;
+    }
+  }
+  credCache = { at: Date.now(), token };
+  return token;
+}
+
+/** Swap the sentinel for real credentials on the Anthropic leg. No-op for any
+ * other Authorization value, so a real token is never touched. */
+async function applyAnthropicAuth(headers) {
+  if (!AUTH_BRIDGE) return headers;
+  if (headers.authorization !== `Bearer ${AUTH_SENTINEL}`) return headers;
+  let token = null;
+  try {
+    token = await anthropicAccessToken();
+  } catch (err) {
+    warnOnce(`credential lookup failed: ${err.message}`);
+  }
+  if (!token) return headers;
+  headers.authorization = `Bearer ${token}`;
+  const betas = String(headers["anthropic-beta"] ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!betas.includes(OAUTH_BETA)) betas.push(OAUTH_BETA);
+  headers["anthropic-beta"] = betas.join(",");
+  return headers;
+}
+
+// ---------------------------------------------------------------------------
 // DeepSeek model list — live from the API, cached, fallback to .env
 // ---------------------------------------------------------------------------
 
@@ -293,10 +487,18 @@ let deepseekIds = new Set(DEFAULT_MODELS);
 // whose id fails /(claude|anthropic)/i, so we serve DeepSeek models under a
 // `claude-deepseek-*` display id and rewrite it back to the real id on request.
 const DISPLAY_PREFIX = "claude-deepseek-";
+// Claude Code sizes the context window of a model it doesn't know from the id
+// itself: a `[1m]` suffix (case-insensitive, matched by regex, no catalog
+// lookup) means a 1M window; anything else falls back to 200k. The
+// `CLAUDE_CODE_MAX_CONTEXT_TOKENS` env var can't substitute here — it is
+// ignored for any id starting with `claude-`, which the discovery filter forces
+// on us. The suffix is stripped again before the request reaches DeepSeek.
+const DISPLAY_SUFFIX = "[1m]";
+const stripWindowSuffix = (id) => String(id).replace(/\[1m\]$/i, "");
 let displayToReal = new Map();
 
 function displayIdOf(id) {
-  return `${DISPLAY_PREFIX}${String(id).replace(/^deepseek-/, "")}`;
+  return `${DISPLAY_PREFIX}${String(id).replace(/^deepseek-/, "")}${DISPLAY_SUFFIX}`;
 }
 
 function displayNameOf(id) {
@@ -334,7 +536,17 @@ async function deepseekModelList() {
   }
   const list = [...models.values()];
   deepseekIds = new Set(models.keys());
-  displayToReal = new Map([...models.keys()].map((id) => [displayIdOf(id), id]));
+  // Key both the suffixed display id and its bare form — Claude Code keeps both
+  // in play when it resolves a model name.
+  displayToReal = new Map(
+    [...models.keys()].flatMap((id) => {
+      const display = displayIdOf(id);
+      return [
+        [display, id],
+        [stripWindowSuffix(display), id],
+      ];
+    })
+  );
   dsModelsCache = { at: Date.now(), models: list };
   return list;
 }
@@ -351,8 +563,14 @@ refreshDeepseekIds();
 /** Real DeepSeek id for a request model id, or null if not a DeepSeek model.
  * Accepts both the display id (`claude-deepseek-v4-flash`) and the real id. */
 const deepseekRealId = (id) => {
+  if (typeof id !== "string") return null;
   if (deepseekIds.has(id)) return id;
-  return displayToReal.get(id) ?? null;
+  if (displayToReal.has(id)) return displayToReal.get(id);
+  // `deepseek-v4-flash[1m]` would 400 upstream — the window suffix is a Claude
+  // Code convention, never part of a real model id.
+  const bare = stripWindowSuffix(id);
+  if (deepseekIds.has(bare)) return bare;
+  return displayToReal.get(bare) ?? null;
 };
 
 /** Claude Code / Opus 5 effort levels: low, medium, high, xhigh, max. DeepSeek
@@ -472,7 +690,7 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
         const status = up.statusCode ?? 502;
         if (FALLBACK && redir && FALLBACK_STATUS.has(status)) {
           up.resume(); // drain so the socket frees
-          forwardToAnthropic(req, res, reqPath, body, null); // original model + body
+          void forwardToAnthropic(req, res, reqPath, body, null).catch((err) => sendError(res, 502, "api_error", err.message)); // original model + body
           return;
         }
         if (status === 200) {
@@ -514,7 +732,7 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
     upstream.on("error", (err) => {
       if (res.headersSent) { res.destroy(); return; }
       if (FALLBACK && redir) {
-        forwardToAnthropic(req, res, reqPath, body, null);
+        void forwardToAnthropic(req, res, reqPath, body, null).catch((e) => sendError(res, 502, "api_error", e.message));
         return;
       }
       sendError(res, 502, "api_error", `deepseek upstream error: ${err.message}`);
@@ -530,9 +748,10 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
 // ---------------------------------------------------------------------------
 
 async function serveModels(req, res) {
+  const modelHeaders = await applyAnthropicAuth(forwardHeaders(req.headers, Buffer.alloc(0)));
   const anthropicModels = await new Promise((resolve) => {
     const upstream = https.request(
-      { hostname: UPSTREAM, port: 443, path: req.url ?? "/v1/models", method: "GET", headers: forwardHeaders(req.headers, Buffer.alloc(0)) },
+      { hostname: UPSTREAM, port: 443, path: req.url ?? "/v1/models", method: "GET", headers: modelHeaders },
       (up) => {
         const chunks = [];
         up.on("data", (c) => chunks.push(c));
@@ -584,9 +803,10 @@ function rewriteModel(body, model) {
   }
 }
 
-function forwardToAnthropic(req, res, reqPath, body, fb) {
+async function forwardToAnthropic(req, res, reqPath, body, fb) {
+  const headers = await applyAnthropicAuth(forwardHeaders(req.headers, body));
   const upstream = https.request(
-    { hostname: UPSTREAM, port: 443, path: reqPath, method: req.method, headers: forwardHeaders(req.headers, body) },
+    { hostname: UPSTREAM, port: 443, path: reqPath, method: req.method, headers },
     (up) => {
       const status = up.statusCode ?? 502;
       if (FALLBACK && fb && FALLBACK_STATUS.has(status)) {
@@ -647,7 +867,7 @@ function handle(req, res) {
         handleDeepSeek(req, res, body, reqPath, { mapped: REDIR_MAP[fam] });
         return;
       }
-      forwardToAnthropic(req, res, reqPath, body, fam && FALLBACK ? { mapped: REDIR_MAP[fam] } : null);
+      void forwardToAnthropic(req, res, reqPath, body, fam && FALLBACK ? { mapped: REDIR_MAP[fam] } : null).catch((err) => sendError(res, 502, "api_error", err.message));
     } catch (err) {
       sendError(res, 500, "api_error", `proxy handler error: ${err.message}`);
     }

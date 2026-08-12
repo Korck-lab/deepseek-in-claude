@@ -30,3 +30,17 @@ debug: false
 effort:
   medium: high  # other-family "medium" -> DeepSeek "high"
   xhigh: max    # other-family "xhigh"  -> DeepSeek "max"
+
+# Anthropic credential bridge. Claude Code only runs gateway model discovery
+# when ANTHROPIC_AUTH_TOKEN is set, and that value would otherwise override your
+# claude.ai login on every request. The proxy swaps this exact sentinel for your
+# real Claude Code OAuth token on the Anthropic leg. Set false (or pass
+# --no-auth-bridge) to disable — Anthropic models then answer 401 in sentinel mode.
+authBridge: true
+sentinel: local-deepseek-proxy
+
+# Let the proxy renew an expired OAuth token and write the rotated value back to
+# your credential store. Off by default: writing to the store the real CLI reads
+# is the one operation here that could cost you a `/login`. Left off, an expired
+# token warns and 401s, and any normal `claude` session refreshes it for you.
+oauthRefresh: false

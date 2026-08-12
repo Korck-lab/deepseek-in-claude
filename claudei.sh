@@ -15,12 +15,13 @@ else
 fi
 
 echo "🚀 Starting claude code irrestrict..."
-CLAUDE_CODE_USE_GATEWAY=1 \
+# ANTHROPIC_AUTH_TOKEN is a sentinel, not a credential: Claude Code only runs
+# gateway model discovery (what puts DeepSeek in the /model picker) when an auth
+# env var is set, and the proxy swaps this exact value for your real Claude Code
+# OAuth token on the Anthropic leg.
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 \
-CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-1000000}" \
-CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1 \
 ANTHROPIC_AUTH_TOKEN="${ANTHROPIC_AUTH_TOKEN:-local-deepseek-proxy}" \
-ANTHROPIC_BASE_URL=http://localhost:$PORT claude --dangerously-skip-permissions --autocompact 350k \
+ANTHROPIC_BASE_URL=http://localhost:$PORT claude --dangerously-skip-permissions \
    --append-system-prompt "Be terse while keep information density. Forward terseness instruction to all sub-agents" \
    "$@"
 EXIT=$?

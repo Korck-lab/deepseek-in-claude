@@ -104,13 +104,15 @@ echo "    claude: $CLAUDE ($("$CLAUDE" --version 2>/dev/null | head -1))"
 
 # T1 --help
 H="$(node "$ROOT/proxy.mjs" --help)"
-check "T1 --help lists flags" 'echo "$H" | grep -q -- "--port" && echo "$H" | grep -q -- "--redir" && echo "$H" | grep -q -- "--fallback"'
+check "T1 --help lists flags" 'echo "$H" | grep -q -- "--port" && echo "$H" | grep -q -- "--redir" && echo "$H" | grep -q -- "--fallback" && echo "$H" | grep -q -- "--no-auth-bridge"'
 
 # T2/T3/T4 default config (port 8016)
 if start_proxy 8016; then
   M="$(curl -s --max-time 15 http://localhost:8016/v1/models)"
   check "T2 /v1/models has deepseek ids" 'echo "$M" | grep -q "deepseek-v4-flash"'
-  if echo "$M" | grep -q '"id":"claude'; then
+  check "T2c display ids carry the [1m] window marker" 'echo "$M" | grep -q "claude-deepseek-v4-flash\[1m\]"'
+  # Must not match the `claude-deepseek-*` display ids — look for a real one.
+  if echo "$M" | grep -qE '"id":"claude-(opus|sonnet|haiku|fable)'; then
     check "T2b /v1/models merged anthropic ids" 'true'
   else
     echo "SKIP T2b anthropic merge (upstream fetch unauthenticated)"
@@ -160,6 +162,12 @@ if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8004 --
 
   FB="$(curl -s --max-time 5 -X POST http://localhost:8004/v1/messages -H "content-type: application/json" -d '{"model":"claude-fable-1","messages":[{"role":"user","content":"x"}]}')"
   check "T7c fable rewritten to deepseek-v4-pro" 'echo "$FB" | grep -q "ROUTED:deepseek-v4-pro"'
+
+  W1="$(curl -s --max-time 5 -X POST http://localhost:8004/v1/messages -H "content-type: application/json" -d '{"model":"claude-deepseek-v4-flash[1m]","messages":[{"role":"user","content":"x"}]}')"
+  check "T13 [1m] window marker stripped before DeepSeek" 'echo "$W1" | grep -q "ROUTED:deepseek-v4-flash EFFORT"'
+
+  W2="$(curl -s --max-time 5 -X POST http://localhost:8004/v1/messages -H "content-type: application/json" -d '{"model":"claude-deepseek-v4-pro","messages":[{"role":"user","content":"x"}]}')"
+  check "T13b bare display id still routes" 'echo "$W2" | grep -q "ROUTED:deepseek-v4-pro"'
 else
   echo "FAIL T7 could not start proxy with mock upstream"
 fi
