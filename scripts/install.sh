@@ -41,6 +41,22 @@ MODE="fresh install"
 if [ -d "$DEST/.git" ]; then
   MODE="update"
   echo "==> existing checkout, updating..."
+  # A modified tracked file makes --ff-only abort with git's "local changes
+  # would be overwritten" — accurate, but it names git as the problem and says
+  # nothing about which of these files a person is expected to care about. The
+  # common cause is a version copied in over the checkout rather than pulled, in
+  # which case there is nothing to keep. .env and config.yml are gitignored and
+  # are never at risk either way, so say so rather than leaving that in doubt.
+  DIRTY="$(git -C "$DEST" status --porcelain --untracked-files=no)"
+  if [ -n "$DIRTY" ]; then
+    echo "error: $DEST has uncommitted changes to tracked files:" >&2
+    printf '%s\n' "$DIRTY" | sed 's/^/       /' >&2
+    echo "" >&2
+    echo "       Your .env and config.yml are gitignored and are not affected." >&2
+    echo "       To see what differs:   git -C $DEST diff" >&2
+    echo "       To discard and update: git -C $DEST checkout -- . && $0" >&2
+    exit 1
+  fi
   git -C "$DEST" pull --ff-only --quiet origin "$BRANCH"
 elif [ -e "$DEST" ] && [ -n "$(ls -A "$DEST" 2>/dev/null || echo x)" ]; then
   # git clone into a non-empty directory fails with "destination path already
