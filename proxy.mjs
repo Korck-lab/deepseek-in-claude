@@ -1059,6 +1059,19 @@ function handle(req, res) {
       }
     });
     try {
+      // Seeding endpoint for claudei.sh, which writes Claude Code's own
+      // gateway-models.json rather than letting the CLI discover the list.
+      // Deliberately not /v1/models: that path merges Anthropic's catalog, which
+      // costs an authenticated round trip the launcher cannot make and would not
+      // use anyway — the picker already carries Anthropic's models as built-in
+      // rows, so only the DeepSeek entries have to be seeded. Named outside /v1
+      // so it can never collide with a real Anthropic route.
+      if (req.method === "GET" && reqPath === "/_proxy/deepseek-models") {
+        const ds = await deepseekModelList();
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ data: ds, has_more: false }));
+        return;
+      }
       if (req.method === "GET" && reqPath.startsWith("/v1/models")) {
         await serveModels(req, res);
         return;

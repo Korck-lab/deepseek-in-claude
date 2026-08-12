@@ -146,3 +146,44 @@ reachable in one session.
 
 **The proxy minting or storing its own Anthropic credential** — a second thing to rotate,
 a long-lived secret on disk, and still not the user's plan.
+
+## Update — 2026-08-12: the sentinel is no longer the default path
+
+The invariant is unchanged and this update strengthens it: the default launch now sets **no
+Anthropic auth environment variable at all**.
+
+"Dropping the auth variable entirely", listed above as rejected, was rejected on a premise
+that turned out to be wrong. Gateway model discovery has two halves, and only one of them
+needs a credential:
+
+- `$vu()` — the *fetch* that refreshes `~/.claude/cache/gateway-models.json`. Returns early
+  unless `ANTHROPIC_AUTH_TOKEN` or an API key is set. This is the half the original decision
+  measured.
+- `Qln()` — the *reader* the `/model` picker actually lists from. Reads the cache file, and
+  never fetches or authenticates.
+
+So the picker can be populated by writing that file directly. `claudei.sh` now seeds it from
+the proxy's own `/_proxy/deepseek-models`, and launches the CLI with no auth variable.
+Measured 2026-08-12 through `sniffer.sh`, a raw tap: the DeepSeek rows list, and the capture
+contains no `GET /v1/models` at all (docs/probe-findings.md §5.3).
+
+What this buys, beyond simplicity: Claude Code disables claude.ai connectors whenever it
+finds an auth environment variable, so the sentinel was costing the user a feature for a
+fetch we did not need.
+
+The Anthropic leg is then authenticated by the CLI's own claude.ai OAuth bearer, which it
+sends unprompted to a custom base URL along with the `oauth-2025-04-20` capability. The
+proxy passes a non-sentinel bearer through untouched, so this is the existing passthrough
+branch, not a new one.
+
+Consequences for the rest of this ADR:
+
+- The sentinel, the credential bridge, `config.yml sentinel:`, and `install.sh`'s per-install
+  generation all **remain supported** for anyone who sets `ANTHROPIC_AUTH_TOKEN`
+  deliberately. Cases A1–A6 are unaffected and still guard that path.
+- **L2 is inverted.** It asserted that the CLI receives the config sentinel; it now asserts
+  the CLI receives no `ANTHROPIC_AUTH_TOKEN` at all. The original wording of L2 warned that
+  the invariant must not be "satisfied by quietly removing discovery" — discovery is not
+  removed here, it is served from a seeded cache, and L4/L5 pin that the seed is written and
+  keyed to the exact base URL.
+- The `x-api-key` strip stays exactly where it is. It never depended on the sentinel.

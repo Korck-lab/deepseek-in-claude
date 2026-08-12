@@ -163,9 +163,9 @@ fi
 
 echo "==> done"
 echo "    start:   node $DEST/proxy.mjs"
-# Both halves matter and neither is guessable: without the sentinel the CLI never
-# runs gateway discovery and DeepSeek stays out of the picker, and without the
-# unset an exported key rides along as x-api-key, which Anthropic prefers over the
-# bearer (ADR-0002). claudei.sh does all of this for you.
-echo "    connect: unset ANTHROPIC_API_KEY; ANTHROPIC_AUTH_TOKEN=\"\$(sed -n 's/^sentinel:[[:space:]]*//p' $CFG_FILE | head -n 1)\" ANTHROPIC_BASE_URL=http://localhost:8016 claude"
-echo "             (or just run claudei.sh, which handles both)"
+# No auth variable is set here on purpose: either one moves Anthropic spend onto
+# API credits (ADR-0002) and disables claude.ai connectors. DeepSeek reaches the
+# picker through the seeded model cache instead, which claudei.sh writes — hence
+# pointing at it rather than printing a recipe that would leave the picker empty.
+echo "    connect: unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN; CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 ANTHROPIC_BASE_URL=http://localhost:8016 claude"
+echo "             (DeepSeek models need the picker cache seeded — run claudei.sh, which does it)"

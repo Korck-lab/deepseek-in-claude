@@ -31,7 +31,7 @@ Then start Claude Code and pick a model with `/model`.
 - **DeepSeek in the model picker** — models are fetched live from the DeepSeek API (10-minute cache) and merged into Anthropic's model list, so `deepseek-v4-flash` and `deepseek-v4-pro` show up natively and you select them with `/model` like any other model.
 - **No protocol translation** — DeepSeek exposes an Anthropic-compatible endpoint, so the proxy forwards native Anthropic SSE. There is no adapter layer to break or debug.
 - **Key isolation** — `DEEPSEEK_API_KEY` is injected as `x-api-key` only on the DeepSeek leg, and `authorization` is dropped there. The Anthropic leg is authenticated by your Claude plan's OAuth session and nothing else: any `x-api-key` the client sends is dropped before the request leaves, because `api.anthropic.com` prefers that header over the bearer and a stray Anthropic API key would silently move your Anthropic spend onto metered API credits.
-- **Anthropic auth stays yours** — model discovery forces an `ANTHROPIC_AUTH_TOKEN` on Claude Code, which would otherwise take precedence over your claude.ai login and 401 every Anthropic model. The proxy swaps that sentinel for your real Claude Code OAuth token on the Anthropic leg, so both providers work in one session. See [Anthropic credential bridge](#anthropic-credential-bridge).
+- **Anthropic auth stays yours, and connectors keep working** — `claudei.sh` sets no Anthropic auth environment variable at all. It writes Claude Code's gateway model cache itself, which is what the `/model` picker actually reads, so nothing has to be authenticated to get DeepSeek listed. Your claude.ai login authenticates Anthropic models as usual, and because no auth variable is set, claude.ai connectors stay enabled. See [Anthropic credential bridge](#anthropic-credential-bridge).
 - **Real 1M context** — DeepSeek V4's window is 1M tokens, but Claude Code assumes 200k for any model it doesn't know. The proxy advertises the display id with Claude Code's `[1m]` marker, so the status line and auto-compact use the real window.
 - **Effort passthrough** — DeepSeek V4 accepts all five Claude Code effort levels (`low|medium|high|xhigh|max`) natively, so nothing is rewritten by default. The `effort` block in `config.yml` is there to remap specific levels if you want.
 - **Instant `count_tokens`** — Claude Code's housekeeping call is answered locally with a fast estimate instead of hitting an undocumented endpoint.
@@ -82,15 +82,18 @@ Then run `/model` and pick `DeepSeek V4 Flash` (or `DeepSeek V4 Pro`). Anthropic
 For the `/model` picker to list the DeepSeek models, Claude Code must run in gateway-discovery mode. That takes exactly two env vars beyond the base URL — the proxy ships `claudei.sh` which sets them, or set them yourself:
 
 ```bash
-unset ANTHROPIC_API_KEY
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+mkdir -p ~/.claude/cache
+curl -fsS http://localhost:8016/_proxy/deepseek-models \
+  | node -e 'let r="";process.stdin.on("data",c=>r+=c).on("end",()=>process.stdout.write(JSON.stringify({baseUrl:"http://localhost:8016",fetchedAt:Date.now(),models:JSON.parse(r).data})))' \
+  > ~/.claude/cache/gateway-models.json
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 \
-ANTHROPIC_AUTH_TOKEN="$(grep -m1 '^sentinel:' ~/.deepseek-in-claude/config.yml | cut -d: -f2- | tr -d " \"'")" \
 ANTHROPIC_BASE_URL=http://localhost:8016 claude
 ```
 
-The `unset` is not tidiness. If your shell exports `ANTHROPIC_API_KEY`, Claude Code sends `x-api-key` *alongside* the bearer, and `api.anthropic.com` prefers the key — so a valid key would authenticate your Anthropic traffic and bill it to API credits while the credential bridge appeared to be working. `ANTHROPIC_AUTH_TOKEN` needs no `unset` here because the line below assigns it outright.
+The `unset` is not tidiness. If your shell exports `ANTHROPIC_API_KEY`, Claude Code sends `x-api-key` *alongside* the bearer, and `api.anthropic.com` prefers the key — so a valid key would authenticate your Anthropic traffic and bill it to API credits while the credential bridge appeared to be working. Either variable also disables claude.ai connectors.
 
-`ANTHROPIC_AUTH_TOKEN` must match the sentinel the proxy expects exactly, or every Anthropic-model request answers 401 — hence reading it straight out of `config.yml`, where the installer wrote it. If you never ran the installer and have no `config.yml`, the value is `local-deepseek-proxy`. `claudei.sh` does this for you, with the inline-comment handling the proxy's own YAML parser applies.
+The `curl` writes the file Claude Code's `/model` picker reads its gateway rows from. Seeding it is what makes the auth variable unnecessary: the discovery *fetch* needs a credential, but the *reader* does not. The `baseUrl` field must match `ANTHROPIC_BASE_URL` byte for byte — Claude Code compares them with a string `!=`, so `localhost` versus `127.0.0.1` silently yields an empty list. `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` is still required: it gates the reader too. `claudei.sh` does all of this for you.
 
 You can also skip discovery entirely and name the model directly — this needs no auth env var at all, and your claude.ai login is untouched:
 
@@ -102,7 +105,7 @@ ANTHROPIC_BASE_URL=http://localhost:8016 claude --model 'claude-deepseek-v4-flas
 
 `claudei.sh` is a convenience launcher: it updates the `claude` CLI, starts the proxy on `:8016` (reusing it if already running), and boots Claude Code with gateway discovery enabled.
 
-It clears `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` from the environment it hands the CLI — both outrank the sentinel at Anthropic and would move your Anthropic spend onto API credits — and prints which of them it ignored, by name only, if you had either exported.
+It clears `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` from the environment it hands the CLI — either would move your Anthropic spend onto API credits, and either disables claude.ai connectors — and prints which of them it ignored, by name only, if you had either exported. It sets neither in their place: the DeepSeek rows come from the model cache it seeds from the proxy, not from an authenticated discovery fetch.
 
 It stops the proxy again on the way out — including after Ctrl+C — and refuses to signal anything on the port that is not actually its own proxy, so a port inherited by some other process is left alone.
 
@@ -148,7 +151,9 @@ The discovery result is cached by Claude Code under `~/.claude/cache/gateway-mod
 
 ### Anthropic credential bridge
 
-Gateway model discovery only runs when Claude Code has an auth env var — `ANTHROPIC_AUTH_TOKEN` or an API key. But whichever one you set then takes precedence over your claude.ai login for *every* request, so a placeholder value makes real Anthropic models answer `401 Invalid bearer token`. Discovery and working Anthropic models look mutually exclusive.
+**As of 2026-08-12 the default launch does not use this.** `claudei.sh` seeds the model cache instead and sets no auth variable, so your claude.ai login authenticates Anthropic models directly and connectors stay enabled. The bridge below remains supported for anyone who sets `ANTHROPIC_AUTH_TOKEN` deliberately.
+
+The problem it solves: the discovery *fetch* only runs when Claude Code has an auth env var — `ANTHROPIC_AUTH_TOKEN` or an API key. But whichever one you set then takes precedence over your claude.ai login for *every* request, so a placeholder value makes real Anthropic models answer `401 Invalid bearer token`. Discovery and working Anthropic models look mutually exclusive.
 
 The proxy resolves it. `ANTHROPIC_AUTH_TOKEN` is a sentinel; requests arriving with exactly that value get your real Claude Code OAuth access token substituted on the Anthropic leg, plus the `oauth-2025-04-20` beta that path requires. Any other `Authorization` value passes through untouched, so a real token is never rewritten. An `x-api-key` header is the exception: whenever the bridge is on it is dropped on the Anthropic leg regardless of the bearer, because Anthropic honours it in preference to the bearer and would bill the request to API credits instead of your plan.
 

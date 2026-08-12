@@ -155,9 +155,22 @@ mkdir -p "$PH" "$WORK/bin" "$WORK/home/.claude/cache" "$WORK/tmpdir"
 SENTINEL="sentinel-for-this-test"
 printf 'sentinel: %s\n' "$SENTINEL" > "$PH/config.yml"
 printf '0.0.0-test\n' > "$PH/VERSION"
-# Only has to stay alive and be recognisable to pid_is_proxy, which matches
-# "proxy\.mjs" in the process command line.
-printf 'setTimeout(() => {}, 600000);\n' > "$PH/proxy.mjs"
+# Has to stay alive, be recognisable to pid_is_proxy (which matches "proxy\.mjs"
+# in the process command line), and serve the one endpoint the launcher seeds the
+# model cache from. A stub rather than the real proxy because the real one needs
+# a DeepSeek key and reaches the network; the contract under test is the
+# launcher's, not the model list's.
+cat > "$PH/proxy.mjs" <<'STUBPROXY'
+import http from "node:http";
+http.createServer((req, res) => {
+  if (req.url === "/_proxy/deepseek-models") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ data: [{ id: "claude-deepseek-v4-flash[1m]", display_name: "DeepSeek V4 Flash", type: "model" }] }));
+    return;
+  }
+  res.writeHead(404).end();
+}).listen(Number(process.env.PORT) || 8899, "127.0.0.1");
+STUBPROXY
 
 # Two invocations reach this stub: `claude update` on the launcher's update
 # check, then the real launch. Only the launch carries the environment under
@@ -187,8 +200,18 @@ CLAUDEI_ENV_DUMP="$DUMP" \
 chk "L0 launcher reached the CLI" '[ -f "$DUMP" ]'
 if [ -f "$DUMP" ]; then
   chk "L1 ANTHROPIC_API_KEY absent from the CLI environment" '! grep -q "^ANTHROPIC_API_KEY=" "$DUMP"'
-  chk "L2 ANTHROPIC_AUTH_TOKEN is the config sentinel, not the exported bearer" 'grep -qx "ANTHROPIC_AUTH_TOKEN=$SENTINEL" "$DUMP"'
+  # No auth variable at all is the point, not an omission. Claude Code disables
+  # claude.ai connectors whenever it finds one, and since the launcher seeds the
+  # model cache itself there is nothing left that needs one — the CLI's own
+  # claude.ai OAuth bearer authenticates the Anthropic leg and the proxy passes
+  # it through untouched. Asserting absence, not a value, is what keeps a future
+  # edit from quietly reintroducing the sentinel and taking connectors with it.
+  chk "L2 ANTHROPIC_AUTH_TOKEN absent from the CLI environment" '! grep -q "^ANTHROPIC_AUTH_TOKEN=" "$DUMP"'
   chk "L3 gateway discovery still enabled" 'grep -qx "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1" "$DUMP"'
+  # The seeded cache is what puts DeepSeek in the picker now, so its absence is a
+  # silent feature loss rather than a crash. HOME is the isolated fixture.
+  chk "L4 launcher seeded the gateway model cache" '[ -s "$WORK/home/.claude/cache/gateway-models.json" ]'
+  chk "L5 cache baseUrl matches the exported base URL exactly" 'grep -q "\"baseUrl\":\"http://localhost:8899\"" "$WORK/home/.claude/cache/gateway-models.json" 2>/dev/null'
 else
   sed 's/^/      /' "$WORK/launcher.log" | tail -10
 fi

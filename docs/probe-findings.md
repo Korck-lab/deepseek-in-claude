@@ -145,6 +145,31 @@ $vu()  // the fetch
 picker entry: { value: id, label: display_name || id, description: "From gateway" }
 ```
 
+Captured payload, 2026-08-12, stub upstream on `127.0.0.1:8990`, `claude -p` twice — once
+with `~/.claude/cache/gateway-models.json` deleted, once with it present:
+
+```http
+GET /v1/models?limit=1000
+authorization: Bearer <ANTHROPIC_AUTH_TOKEN>      # or x-api-key when only the key is set
+anthropic-version: 2023-06-01
+user-agent: claude-code/2.1.228
+accept: */*
+```
+
+No request body, no `anthropic-beta`. The reply was a normal model list whose entries
+carried `type`, `created_at` and a junk `extra_field` alongside `id`/`display_name`; what
+landed on disk was only:
+
+```json
+{ "baseUrl": "http://127.0.0.1:8990", "fetchedAt": 1786553772389,
+  "models": [ { "id": "claude-deepseek-v4-flash[1m]", "display_name": "DeepSeek V4 Flash" } ] }
+```
+
+**Both runs fetched.** The cache did not suppress the request on the warm run, so it is a
+seed the picker can fall back on, not a gate in front of the fetch — which is why a stale
+`gateway-models.json` only ever shows up as a *wrong* list, never as a missing one, and why
+the launcher can purge it unconditionally without costing a round trip.
+
 Consequences:
 
 - The id filter is why DeepSeek models are served as `claude-deepseek-*`.
@@ -225,3 +250,105 @@ inherits from a shell that exports the key. Hence the two fixes of the same date
 `claudei.sh` unsets both variables before launching the CLI, and `applyAnthropicAuth`
 drops `x-api-key` on the Anthropic leg — below the `--no-auth-bridge` escape hatch, above
 the sentinel gate. Guarded by `scripts/test-auth-bridge.sh`.
+
+## 5. What the gateway protocol actually specifies — added 2026-08-12
+
+Source: Anthropic's own documentation, which turns out to specify this feature in full.
+Everything in §1–§2 was reverse-engineered from the binary before we found it. The docs
+confirm the mechanics and correct two conclusions we had drawn from them.
+
+- <https://code.claude.com/docs/en/llm-gateway-protocol#model-discovery>
+- <https://code.claude.com/docs/en/model-config#correct-the-window-for-a-gateway-or-custom-model-id>
+
+### 5.1 The payload cannot carry a context window
+
+The response schema is exactly two fields, and this is the documented contract, not an
+implementation detail we might grow out of:
+
+> Claude Code reads `id` and the optional `display_name` from each entry in the response's
+> `data` array.
+
+There is no field for context window, max output tokens, or capabilities. The docs are also
+explicit that the provider-capability variables do not fill the gap:
+
+> The `ANTHROPIC_DEFAULT_*_MODEL_SUPPORTED_CAPABILITIES` variables declare model
+> capabilities only in the provider configurations […] They have no effect behind an
+> `ANTHROPIC_BASE_URL` gateway.
+
+So a gateway describes *which* models exist and nothing about *what they are*. Every other
+model property is client-side, which is why the window has to be solved with environment
+variables rather than by enriching what `serveModels` returns.
+
+### 5.2 The id filter loosened, and that unblocks the window
+
+§1 records the filter as the reason DeepSeek models are named `claude-deepseek-*`, and §2
+records that `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is skipped for exactly that prefix — the two
+mechanisms read as mutually exclusive. They are not, as of 2.1.223:
+
+> Claude Code keeps an entry when its `id` contains `claude` or `anthropic` anywhere in the
+> string, matched case-insensitively […] Provider-prefixed IDs such as
+> `vertex_ai/claude-sonnet-4-6` […] pass the filter. Before v2.1.223, Claude Code kept an
+> entry only when its `id` began with `claude` or `anthropic`.
+
+The window rule keys on `startsWith("claude-")`, the filter on *contains*. An id such as
+`deepseek/claude-deepseek-chat` satisfies the filter without triggering the prefix rule, and
+the docs confirm that is the supported case:
+
+> If the ID doesn't start with `claude-` or contain `[1m]`, in any casing, and Claude Code
+> can't resolve it to a Claude model, the variable applies directly and proactive compaction
+> continues at the declared window.
+
+That is the only combination that yields a *correct* window with proactive compaction
+intact. The alternatives both degrade: `[1m]` claims a flat 1M regardless of the model's
+real window, and a `claude-` prefix needs `DISABLE_COMPACT`, which turns compaction off
+entirely. ADR-0001 chose its ids under the old filter and should be revisited against this.
+
+Note the scope of `CLAUDE_CODE_MAX_CONTEXT_TOKENS`: it is one value for the whole session,
+not per model. Declaring DeepSeek's window necessarily misdeclares the Anthropic models in
+the same session, so this is a trade to make deliberately.
+
+### 5.3 The cache lists models with no fetch and no credential
+
+Measured 2026-08-12 with `sniffer.sh`, which is a raw tap that neither bridges credentials
+nor merges models. `~/.claude/cache/gateway-models.json` was hand-written, the discovery
+flag set, and no auth environment variable exported at all:
+
+```
+/model  ->  7. DeepSeek Chat   From gateway
+            8. DeepSeek Chat   From gateway
+capture ->  2 exchanges, GET /v1/models: NONE
+```
+
+The picker's list comes from `Qln()`, which reads the cache file and never fetches; the
+credential check lives only in `$vu()`, the refresher. So listing needs the flag, a
+non-Anthropic `ANTHROPIC_BASE_URL`, and a cache `baseUrl` byte-identical to it (compared
+with `!==`) — and no credential. This does not contradict §1's "both runs fetched": the
+fetch still happens whenever a credential is present, and the docs say the cache is
+"refreshed on each startup". A seeded file is therefore authoritative only for as long as
+no authenticated discovery run overwrites it.
+
+Two limits found the same way. The label is `display_name || id` with no suffix logic, so
+two variants of one model render identically unless the distinction is baked into
+`display_name`. And seeding does not register a context window — the "not a model this
+version recognizes" notice persists, because that path never consults the cache.
+
+### 5.4 Other documented facts worth not rediscovering
+
+- Discovery is `GET /v1/models?limit=1000` with a **3-second timeout**, and **any redirect
+  is treated as failure** so the credential cannot leak to a redirect target. Serving the
+  endpoint anywhere but directly at the base URL fails discovery silently.
+- The credential is **one header, not both**: `ANTHROPIC_AUTH_TOKEN` as a bearer when set,
+  otherwise the resolved API key as `x-api-key`. Inference requests send both, so a gateway
+  that authenticates `/v1/models` must accept `x-api-key` too.
+- A discovered id is **skipped when it matches a picker row already**, and an explicit id is
+  folded into a built-in row when both resolve to the same model. Serving `claude-sonnet-5`
+  would collapse into the `sonnet` row rather than adding one.
+- `availableModels` bounds what discovery may add; `modelOverrides` keys **must be real
+  Anthropic model ids** ("Unknown keys are ignored"), so it cannot register an invented id —
+  it can only redirect a genuine one at a different upstream string.
+- `ANTHROPIC_CUSTOM_MODEL_OPTION` skips id validation entirely and needs no flag, no cache
+  and no credential, but is **a single entry**. An id embedding a family name also disables
+  that family's `availableModels` wildcard.
+- The `claude gateway` command is the enterprise auth/telemetry broker (Postgres, OIDC, JWT,
+  CIDR policy). Connecting to one makes `Vn()` return `"gateway"`, which fails `eTs()` — it
+  **disables** model discovery. Same word, opposite feature.

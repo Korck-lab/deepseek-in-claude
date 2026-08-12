@@ -143,44 +143,84 @@ else
   printf '%s' "$SHA" >"$STAMP"
 fi
 
-# Claude Code caches the discovered model list keyed by base URL, which never
-# changes here — so a list captured before a proxy change would survive the
-# restart and show stale ids. Purge unconditionally: the reuse path above can
-# still be serving a list captured by an older proxy.
-rm -f "$HOME/.claude/cache/gateway-models.json"
+# --- model list --------------------------------------------------------------
+# Claude Code builds the /model picker's gateway rows from this cache file, not
+# from a live fetch: the reader takes the file, and the fetch that would refresh
+# it runs only when an auth environment variable is set (documented at
+# code.claude.com/docs/en/llm-gateway-protocol#model-discovery, and measured —
+# see docs/probe-findings.md §5.3). Writing the file ourselves is what lets the
+# launcher set no auth variable at all, which is what keeps claude.ai connectors
+# working; the CLI disables them whenever one is present.
+#
+# Purged first and unconditionally, because a list captured by an older proxy is
+# keyed by the same base URL and would otherwise survive the restart as stale ids.
+CACHE_DIR="$HOME/.claude/cache"
+rm -f "$CACHE_DIR/gateway-models.json"
+
+# The base URL is a variable rather than a literal from here on: Claude Code
+# compares the cache's baseUrl to ANTHROPIC_BASE_URL with a string !=, so
+# "localhost" vs "127.0.0.1", or a stray trailing slash, silently yields an empty
+# gateway list that looks exactly like the feature not working.
+BASE_URL="http://localhost:$PORT"
+
+# Only the DeepSeek entries are seeded. Anthropic's models are already built-in
+# rows in the picker, and this endpoint skips the proxy's Anthropic leg so the
+# launcher needs no credential to build the list.
+mkdir -p "$CACHE_DIR"
+if MODELS_JSON="$(curl -fsS --max-time 10 "$BASE_URL/_proxy/deepseek-models" 2>/dev/null)"; then
+  # Written through a temp file and renamed so a half-written cache can never be
+  # read by the CLI starting up beside us.
+  TMP_CACHE="$(mktemp "$CACHE_DIR/gateway-models.XXXXXX")"
+  if printf '%s' "$MODELS_JSON" | BASE_URL="$BASE_URL" node -e '
+    let raw = "";
+    process.stdin.on("data", (c) => (raw += c));
+    process.stdin.on("end", () => {
+      const models = JSON.parse(raw).data ?? [];
+      if (models.length === 0) process.exit(1);
+      process.stdout.write(JSON.stringify({
+        baseUrl: process.env.BASE_URL,
+        fetchedAt: Date.now(),
+        models,
+      }));
+    });
+  ' >"$TMP_CACHE" 2>/dev/null; then
+    chmod 600 "$TMP_CACHE"
+    mv "$TMP_CACHE" "$CACHE_DIR/gateway-models.json"
+    echo "   seeded the model picker from the proxy"
+  else
+    rm -f "$TMP_CACHE"
+    echo "   warning: could not build the model list — DeepSeek models will be missing from /model" >&2
+  fi
+else
+  echo "   warning: proxy did not serve a model list — DeepSeek models will be missing from /model" >&2
+fi
 
 # --- claude ------------------------------------------------------------------
 
 echo "🚀 Starting claude code irrestrict..."
-# ANTHROPIC_AUTH_TOKEN is a sentinel, not a credential: Claude Code only runs
-# gateway model discovery (what puts DeepSeek in the /model picker) when an auth
-# env var is set, and the proxy swaps this exact value for your real Claude Code
-# OAuth token on the Anthropic leg.
+# No auth environment variable is set, deliberately. Claude Code disables
+# claude.ai connectors whenever it finds one, and with the picker seeded above
+# there is nothing left that needs one: the CLI authenticates the Anthropic leg
+# with its own claude.ai OAuth bearer, which the proxy passes through untouched
+# (a bearer that is not the sentinel is never rewritten), and which already
+# carries the oauth-2025-04-20 capability the upstream requires.
 #
-# The value must match what the proxy expects exactly or every Anthropic-model
-# request 401s, so both sides read it from the same config.yml. install.sh
-# writes a per-install random value there; if the key is absent, both fall back
-# to the historical literal. Parsing mirrors the proxy's YAML subset: strip an
-# inline comment (whitespace + #) and surrounding quotes.
+# The sentinel and the credential bridge are not gone — they remain the
+# supported path for anyone who sets ANTHROPIC_AUTH_TOKEN deliberately, and
+# proxy.mjs still swaps that exact value for the real OAuth token. This launcher
+# simply no longer needs them, having previously set the sentinel only to make
+# gateway model discovery run at all.
 #
-# When that key is absent, the proxy still honours ANTHROPIC_AUTH_SENTINEL from
-# the environment it inherits, so this side has to read the same variable or the
-# two disagree and every Anthropic-model request 401s. It is not a credential —
-# it names the placeholder — which is why it survives the unset below while
-# ANTHROPIC_AUTH_TOKEN does not.
-SENTINEL="$(sed -n 's/^sentinel:[[:space:]]*//p' "$PROXY_HOME/config.yml" 2>/dev/null \
-  | head -n 1 | sed 's/[[:space:]][[:space:]]*#.*$//' | tr -d "\"'" | tr -d '[:space:]')"
-
 # Whatever this shell already exports is cleared rather than deferred to, because
 # either variable outranks the sentinel at the upstream and moves your Anthropic
 # spend off the plan you already pay for (ADR-0002). ANTHROPIC_API_KEY is the
 # quiet one: the CLI sends it as x-api-key alongside the bearer, api.anthropic.com
 # prefers the key, so a valid one authenticates and bills every Anthropic request
 # to API credits while the sentinel swap still looks like it is working.
-# ANTHROPIC_AUTH_TOKEN is the loud one: it would win the ${:-} below and be
-# forwarded to Anthropic verbatim, bridging nothing. Mutating this shell's own
-# environment is safe because nothing below reads either name — SENTINEL comes
-# from config.yml alone, and the EXIT trap only stops the proxy.
+# ANTHROPIC_AUTH_TOKEN is the loud one: it would be forwarded to Anthropic
+# verbatim, bridging nothing, and it would disable claude.ai connectors on top.
+# Mutating this shell's own environment is safe because nothing below reads
+# either name — the EXIT trap only stops the proxy.
 #
 # A value you deliberately exported vanishing without a word is its own surprise,
 # so say so. It goes to stdout beside the other 🚀 progress lines because it
@@ -203,9 +243,10 @@ if [ "${CLAUDEI_SKIP_PERMISSIONS:-1}" != "0" ]; then
 fi
 
 # shellcheck disable=SC2086
+# The discovery flag stays set even though nothing fetches: it also gates the
+# *reader* of the seeded cache, so without it the picker shows no gateway rows.
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 \
-ANTHROPIC_AUTH_TOKEN="${SENTINEL:-${ANTHROPIC_AUTH_SENTINEL:-local-deepseek-proxy}}" \
-ANTHROPIC_BASE_URL=http://localhost:$PORT "$CLAUDE" $CLAUDE_FLAGS \
+ANTHROPIC_BASE_URL="$BASE_URL" "$CLAUDE" $CLAUDE_FLAGS \
    --append-system-prompt "Be terse while keep information density. Forward terseness instruction to all sub-agents" \
    "$@"
 EXIT=$?
