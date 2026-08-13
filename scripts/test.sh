@@ -276,6 +276,95 @@ else
   echo "FAIL T12 could not start proxy on 8009"
 fi
 
+# Vision redirect (ADR-0004): a DeepSeek-bound request carrying an image block is
+# rerouted to a vision-capable Anthropic model instead of 400ing upstream. V1 is
+# one real claude-opus-5 answer (tiny cost, mirrors T8's real-API pattern); V2/V3
+# prove the gates against the mock. 1x1 transparent PNG so the real model accepts
+# the image.
+PNG="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+# max_tokens is required by the real Anthropic leg this redirects to; without it
+# V1 comes back invalid_request_error and the echo assertion never gets to run.
+IMG_BODY='{"model":"claude-deepseek-v4-flash[1m]","stream":true,"max_tokens":32,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"'"$PNG"'"}},{"type":"text","text":"Reply with exactly: OK"}]}]}'
+
+cat >"$TMP/vision.yml" <<'EOF'
+port: 8010
+sentinel: test-vision-sentinel
+vision:
+  redirect: true
+EOF
+if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8010 --port 8010 --config "$TMP/vision.yml"; then
+  V1="$(curl -s --max-time 30 -X POST http://localhost:8010/v1/messages -H "content-type: application/json" -H "authorization: Bearer test-vision-sentinel" -H "anthropic-version: 2023-06-01" -d "$IMG_BODY")"
+  # The gate itself is deterministic and free: whatever Anthropic answers, the
+  # mock must never have seen this request.
+  check "V1 image on deepseek redirects (mock never served it)" '! echo "$V1" | grep -q "ROUTED:"'
+  # The echo assertion needs a real 200. An account rate limit or an expired
+  # OAuth token is not a redirect bug, and asserting through one would report it
+  # as one — the rewrite itself is covered by test-parsing.sh's
+  # restoreClientModel cases, so skip loudly rather than fail misleadingly.
+  if echo "$V1" | grep -q '"type":"error"'; then
+    echo "SKIP  V1b display-id echo (Anthropic leg returned an error: $(echo "$V1" | sed -n 's/.*"type":"\([a-z_]*_error\)".*/\1/p' | head -1))"
+  else
+    check "V1b redirected response echoes the display id" 'echo "$V1" | grep -q "\"model\":\"claude-deepseek-v4-flash\[1m\]\""'
+    check "V1c redirected turn logged with a redirected field" 'grep -q "\"redirected\"" "$ROOT/logs/proxy-usage.jsonl"'
+  fi
+
+  # negative control: same proxy, no image, still routes to the mock
+  N="$(curl -s --max-time 5 -X POST http://localhost:8010/v1/messages -H "content-type: application/json" -d '{"model":"claude-deepseek-v4-flash[1m]","messages":[{"role":"user","content":"x"}]}')"
+  check "V1d no-image request still routes to deepseek" 'echo "$N" | grep -q "ROUTED:deepseek-v4-flash"'
+else
+  echo "FAIL V1 could not start proxy with vision config"
+fi
+
+cat >"$TMP/vision-off.yml" <<'EOF'
+port: 8011
+vision:
+  redirect: false
+EOF
+if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8011 --port 8011 --config "$TMP/vision-off.yml"; then
+  V2="$(curl -s --max-time 5 -X POST http://localhost:8011/v1/messages -H "content-type: application/json" -d "$IMG_BODY")"
+  check "V2 vision.redirect false leaves image on deepseek" 'echo "$V2" | grep -q "ROUTED:deepseek-v4-flash"'
+else
+  echo "FAIL V2 could not start proxy with vision-off config"
+fi
+
+# A redir-routed family name is DeepSeek-bound too, so the image check fires — but
+# the response must still echo `sonnet`, the id the client sent. Echoing a DeepSeek
+# display id here would flip the session model, which is the failure the redirect
+# exists to avoid, pointed the other way.
+cat >"$TMP/vision-redir.yml" <<'EOF'
+port: 8013
+redir:
+  sonnet: deepseek-v4-flash
+vision:
+  redirect: true
+EOF
+IMG_SONNET='{"model":"claude-sonnet-4-5","stream":true,"max_tokens":32,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"'"$PNG"'"}},{"type":"text","text":"hi"}]}]}'
+if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8013 --port 8013 --config "$TMP/vision-redir.yml"; then
+  V4="$(curl -s --max-time 30 -X POST http://localhost:8013/v1/messages -H "content-type: application/json" -H "anthropic-version: 2023-06-01" -d "$IMG_SONNET")"
+  check "V4 redir-routed image redirects too (mock never served it)" '! echo "$V4" | grep -q "ROUTED:"'
+  check "V4b redirect never answers with a deepseek display id for a redir turn" '! echo "$V4" | grep -q "claude-deepseek-"'
+
+  NR="$(curl -s --max-time 5 -X POST http://localhost:8013/v1/messages -H "content-type: application/json" -d '{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"x"}]}')"
+  check "V4c redir without an image still routes to deepseek" 'echo "$NR" | grep -q "ROUTED:deepseek-v4-flash"'
+else
+  echo "FAIL V4 could not start proxy with redir+vision config"
+fi
+
+cat >"$TMP/vision-cap.yml" <<'EOF'
+port: 8012
+vision:
+  redirect: true
+capabilities:
+  deepseek-v4-flash:
+    vision: true
+EOF
+if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8012 --port 8012 --config "$TMP/vision-cap.yml"; then
+  V3="$(curl -s --max-time 5 -X POST http://localhost:8012/v1/messages -H "content-type: application/json" -d "$IMG_BODY")"
+  check "V3 capability override vision:true keeps image on deepseek" 'echo "$V3" | grep -q "ROUTED:deepseek-v4-flash"'
+else
+  echo "FAIL V3 could not start proxy with capability config"
+fi
+
 # T8 forward fallback: dead deepseek -> real anthropic
 if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:1" start_proxy 8005 --port 8005 --redir --fallback; then
   O="$(cc 8005 --model sonnet "Reply with exactly: OK")"

@@ -59,6 +59,15 @@ someone setting `ANTHROPIC_AUTH_TOKEN` deliberately, not the default one.
 **Fallback** — the `--fallback` mode that retries the *other* leg when an upstream
 returns 404/429/5xx. Bidirectional.
 
+**Vision redirect** — the reroute of a request carrying an image block away from a
+vision-less model (DeepSeek V4 has no vision) to a vision-capable Anthropic model
+(`claude-opus-5`, effort `low`, by default). Fires at route time when the resolved
+target's capability is `vision: false`; the redirected response echoes the client's
+display id so the session model survives. Distinct from *fallback* — the redirect leg
+forwards with `fb: null` on purpose. Capabilities are fetched from `/v1/models` when
+reported, defaulted per family otherwise, and overridable in the `capabilities:`
+config block. See ADR-0004.
+
 ## Shape of proxy.mjs
 
 Sections in file order:
@@ -69,11 +78,13 @@ Sections in file order:
 | Payload debug log | `--debug`, one JSON line per request/response |
 | Anthropic credential bridge | sentinel → real OAuth token, optional refresh grant |
 | DeepSeek model list | live fetch, 10-min cache, `.env` fallback, display/real mapping |
+| Vision capability map | which models can see images: config override > provider-reported > family default |
 | Usage log | one JSON line per DeepSeek request, always on |
 | DeepSeek routing | transparent forward to the Anthropic-compatible endpoint |
 | Merged model list | serves `GET /v1/models` — union of both legs |
-| Anthropic forward | body untouched; credential headers reworked by the bridge |
-| Server | request dispatch |
+| Anthropic forward | body untouched (credential headers reworked by the bridge); head-buffers to rewrite `model` on a vision redirect |
+| Image routing helpers | `hasImageBlock` (recursive, anchored on `type`), `rewriteVision` |
+| Server | request dispatch, including the pre-dispatch vision check |
 
 ## Deployment topology — read this before debugging
 

@@ -407,6 +407,24 @@ let credInFlight = null;
 const credWarned = new Set();
 let refreshInFlight = null;
 
+// ---------------------------------------------------------------------------
+// Vision redirect config
+//
+// DeepSeek V4 models have no vision; a request carrying an image block 400s
+// upstream. When the resolved target model lacks vision capability, such a
+// request is rerouted to a vision-capable Anthropic model instead (see the
+// Vision capability map section). On by default — the alternative is a hard 400 —
+// and it only costs Anthropic plan traffic when an image actually appears.
+// ---------------------------------------------------------------------------
+
+const VISION_REDIRECT = CFG.vision?.redirect !== false;
+const VISION_MODEL = CFG.vision?.model ?? "claude-opus-5";
+const VISION_EFFORT = CFG.vision?.effort ?? "low";
+
+if (VISION_REDIRECT && !AUTH_BRIDGE) {
+  warnOnce(`vision redirect is on but the credential bridge is off — redirected image requests to ${VISION_MODEL} will answer 401`, "vision");
+}
+
 function warnOnce(message, scope = "auth-bridge") {
   if (credWarned.has(message)) return;
   credWarned.add(message);
@@ -602,6 +620,46 @@ const MODEL_CACHE_TTL = 10 * 60 * 1000;
 let dsModelsCache = { at: 0, models: null };
 let dsModelsInFlight = null;
 
+// ---------------------------------------------------------------------------
+// Vision capability map
+//
+// Which models can see images. Sources, in precedence order: an explicit
+// `capabilities:` config override, a value read from a provider's model list
+// (`capabilities.image_input.supported` — Anthropic reports it, DeepSeek does
+// not yet), then a per-family default: claude models are vision-capable today,
+// everything else is assumed not to be. A future provider that reports the
+// field is picked up by the same readers with no rule to add; one that does not
+// falls back to its family default, overridable in config. The seam is "read if
+// reported, defaulted otherwise" rather than a hardcoded DeepSeek-to-Anthropic
+// rule.
+//
+// Declared above refreshDeepseekIds() on purpose: that call fires at module
+// init and its model-list reader writes here, so the binding has to exist by
+// then rather than depend on an await to escape the temporal dead zone.
+// ---------------------------------------------------------------------------
+
+const visionByModel = new Map();
+
+/** Fallback when nobody reported a capability for this id. */
+function visionDefaultFor(id) {
+  return /^(claude-|us\.anthropic\.)/.test(String(id ?? ""));
+}
+
+/** Read `capabilities.image_input.supported` off a provider's model-list entry.
+ * Silent when the field is absent — that is the common case, not an error. */
+function readVisionCapability(entry) {
+  const supported = entry?.capabilities?.image_input?.supported;
+  if (typeof supported === "boolean" && typeof entry?.id === "string") visionByModel.set(entry.id, supported);
+}
+
+function capabilityOf(id) {
+  const override = CFG.capabilities?.[id];
+  if (override && typeof override === "object" && typeof override.vision === "boolean") return override.vision;
+  const reported = visionByModel.get(id);
+  if (reported !== undefined) return reported;
+  return visionDefaultFor(id);
+}
+
 // Real DeepSeek model ids this proxy will route to upstream.
 let deepseekIds = new Set(DEFAULT_MODELS);
 // Display id -> real id. Claude Code's gateway model discovery drops any model
@@ -685,7 +743,15 @@ async function fetchDeepseekModelList() {
         headers: { authorization: `Bearer ${DEEPSEEK_API_KEY}` },
       });
       if (status === 200 && json?.data) {
-        for (const m of json.data) if (m?.id) models.set(m.id, toModelEntry(m.id, m.created ?? 0));
+        for (const m of json.data) {
+          if (!m?.id) continue;
+          models.set(m.id, toModelEntry(m.id, m.created ?? 0));
+          // DeepSeek does not report capabilities today, so this reads nothing
+          // and the family default (no vision) stands. It exists so that a model
+          // list which *does* start reporting image_input needs no code change —
+          // the vision redirect stops firing for that model on its own.
+          readVisionCapability(m);
+        }
       }
     } catch {
       /* models fetch failed — fallback list stands */
@@ -1006,6 +1072,13 @@ async function serveModels(req, res) {
     );
   }
 
+  // Vision capability overlay: Anthropic reports image_input support per model,
+  // so record it here on the list fetch the picker already makes. `capabilities:`
+  // in config.yml still wins over anything read. See ADR-0004.
+  if (Array.isArray(anthropicModels.json?.data)) {
+    for (const m of anthropicModels.json.data) readVisionCapability(m);
+  }
+
   const data = Array.isArray(anthropicModels.json?.data) ? [...anthropicModels.json.data] : [];
   const seen = new Set(data.map((m) => m.id));
   for (const m of ds) if (!seen.has(m.id)) data.push(m);
@@ -1059,11 +1132,12 @@ function rewriteModel(body, model) {
   }
 }
 
-async function forwardToAnthropic(req, res, reqPath, body, fb) {
+async function forwardToAnthropic(req, res, reqPath, body, fb, opts = {}) {
   const headers = await applyAnthropicAuth(forwardHeaders(req.headers, body));
   // Mirror image of the guard in handleDeepSeek: once this leg falls back, the
   // DeepSeek leg owns the response and a late error here must not touch it.
   let handedOff = false;
+  const started = Date.now();
   const clearUpstreamTimeout = () => upstream.setTimeout(0);
   const upstream = https.request(
     { hostname: UPSTREAM, port: 443, path: reqPath, method: req.method, headers },
@@ -1077,6 +1151,43 @@ async function forwardToAnthropic(req, res, reqPath, body, fb) {
         return;
       }
       res.writeHead(status, cleanResponseHeaders(up.headers));
+      if (status === 200 && opts.restoreModel) {
+        // Answer in the client's vocabulary: `message_start` reports the model
+        // actually sent upstream, and a resumed session restores its model from
+        // that field — so a redirected turn must echo the client's display id,
+        // not the vision model. Hold bytes only until the first SSE event is
+        // complete, rewrite the `model` field, stream the rest. Mirror of the
+        // head-buffering in handleDeepSeek; only the redirect leg needs it, a
+        // plain Anthropic passthrough streams straight through.
+        const respChunks = [];
+        let head = Buffer.alloc(0);
+        up.on("data", (c) => {
+          respChunks.push(c);
+          if (head === null) { res.write(c); return; }
+          head = Buffer.concat([head, c]);
+          const text = head.toString("utf8");
+          const end = text.indexOf("\n\n");
+          if (end === -1 && head.length < 65536) return;
+          res.write(Buffer.from(restoreClientModel(text, opts.restoreModel, opts.realModel), "utf8"));
+          head = null;
+        });
+        up.on("end", () => {
+          // A response that ended before its first event boundary — short,
+          // non-SSE, or truncated — still has to reach the client.
+          if (head !== null && head.length > 0) {
+            res.write(Buffer.from(restoreClientModel(head.toString("utf8"), opts.restoreModel, opts.realModel), "utf8"));
+          }
+          head = null;
+          clearUpstreamTimeout();
+          res.end();
+          // Redirected turns bill Anthropic plan traffic; make them visible in
+          // the usage log or they read as missing.
+          if (opts.redirected) {
+            logUsage({ method: req.method, path: reqPath, status, ms: Date.now() - started, model: opts.realModel, usage: decodeSse(Buffer.concat(respChunks).toString("utf8")), redirected: opts.redirected });
+          }
+        });
+        return;
+      }
       up.on("data", (c) => res.write(c));
       up.on("end", () => {
         clearUpstreamTimeout();
@@ -1097,6 +1208,41 @@ async function forwardToAnthropic(req, res, reqPath, body, fb) {
   });
   if (body.length > 0) upstream.write(body);
   upstream.end();
+}
+
+// ---------------------------------------------------------------------------
+// Image routing helpers
+// ---------------------------------------------------------------------------
+
+/** Image-bearing request? Recursive walk anchored on the `type` field — matches
+ * any object whose type is "image", wherever it sits (messages[].content,
+ * context[], tool_result.content), while prose mentioning the word never
+ * matches. Non-JSON bodies cannot carry an image block. */
+function hasImageBlock(bodyBuf) {
+  let root;
+  try {
+    root = JSON.parse(bodyBuf.toString("utf8"));
+  } catch {
+    return false;
+  }
+  const walk = (node) => {
+    if (!node || typeof node !== "object") return false;
+    if (Array.isArray(node)) return node.some(walk);
+    if (node.type === "image") return true;
+    for (const key of Object.keys(node)) if (walk(node[key])) return true;
+    return false;
+  };
+  return walk(root);
+}
+
+/** Rewrite an image-bearing request for the vision-capable leg: swap the model,
+ * force the configured effort, keep everything else. `clientModel` is the id the
+ * response must echo so a resumed session keeps its display model. */
+function rewriteVision(bodyBuf, model, effort, clientModel) {
+  const j = JSON.parse(bodyBuf.toString("utf8"));
+  j.model = model;
+  if (effort) j.output_config = { ...(j.output_config ?? {}), effort };
+  return { body: Buffer.from(JSON.stringify(j)), clientModel };
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,11 +1283,35 @@ function handle(req, res) {
       if (body.length > 0) {
         try { model = JSON.parse(body.toString("utf8"))?.model ?? null; } catch { /* not JSON */ }
       }
+      const fam = model ? familyOf(model) : null;
+      // The resolved DeepSeek-bound target, whether the model was a DeepSeek id
+      // outright or a family name being redir-routed. The vision check keys off
+      // it: a request carrying an image to a vision-less model is rerouted at
+      // route time, not left to 400 upstream. Independent of the retry-on-error
+      // fallback — and the redirect leg forwards with fb null on purpose, so a
+      // later failure cannot re-send the image to the vision-less model.
+      const dsReal = model ? deepseekRealId(model) : null;
+      const dsTarget = dsReal ?? (fam && redirOn ? REDIR_MAP[fam] : null);
+      if (VISION_REDIRECT && !isTokenCount(reqPath) && dsTarget && capabilityOf(dsTarget) === false && hasImageBlock(body)) {
+        // Echo exactly what the normal DeepSeek path would have echoed: the
+        // canonical display id for a DeepSeek model, and the client's own string
+        // for a family name being redir-routed. Answering a `--redir --model
+        // sonnet` turn with a DeepSeek display id would flip the session model
+        // on the user — the same failure ADR-0004 redirects to avoid, pointed
+        // the other way.
+        const echo = dsReal ? displayIdOf(dsReal) : model;
+        const { body: vBody, clientModel } = rewriteVision(body, VISION_MODEL, VISION_EFFORT, echo);
+        void forwardToAnthropic(req, res, reqPath, vBody, null, {
+          restoreModel: clientModel,
+          realModel: VISION_MODEL,
+          redirected: { to: VISION_MODEL, reason: "vision", effort: VISION_EFFORT },
+        }).catch((err) => sendError(res, 502, "api_error", err.message));
+        return;
+      }
       if (model && deepseekRealId(model)) {
         handleDeepSeek(req, res, body, reqPath, null);
         return;
       }
-      const fam = model ? familyOf(model) : null;
       if (fam && redirOn) {
         handleDeepSeek(req, res, body, reqPath, { mapped: REDIR_MAP[fam] });
         return;

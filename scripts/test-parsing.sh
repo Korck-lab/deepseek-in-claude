@@ -22,6 +22,9 @@ trap 'rm -rf "$WORK"' EXIT INT TERM
   echo 'const REDIR_MAP = { haiku: 1, sonnet: 1, opus: 1, fable: 1 };'
   echo 'const FAMILY_KEYS = Object.keys(REDIR_MAP);'
   sed -n '/^function familyOf/,/^}$/p' "$REPO/proxy.mjs"
+  sed -n '/^function hasImageBlock/,/^}$/p' "$REPO/proxy.mjs"
+  sed -n '/^function rewriteVision/,/^}$/p' "$REPO/proxy.mjs"
+  sed -n '/^function restoreClientModel/,/^}$/p' "$REPO/proxy.mjs"
   cat <<'CASES'
 
 let fails = 0;
@@ -31,7 +34,7 @@ const eq = (label, got, want) => {
   console.log(`${ok ? "ok  " : "FAIL"} ${label}: got ${JSON.stringify(got)} want ${JSON.stringify(want)}`);
 };
 
-for (const fn of [loadYaml, normalizeModel, familyOf]) {
+for (const fn of [loadYaml, normalizeModel, familyOf, hasImageBlock, rewriteVision, restoreClientModel]) {
   if (typeof fn !== "function") { console.error("extraction failed"); process.exit(2); }
 }
 
@@ -79,6 +82,50 @@ eq("v4pro", normalizeModel("v4pro"), "deepseek-v4-pro");
 eq("future v5-pro", normalizeModel("v5-pro"), "deepseek-v5-pro");
 eq("typo is not prefixed", normalizeModel("gpt-4"), "gpt-4");
 eq("anthropic id is not prefixed", normalizeModel("claude-haiku-4-5"), "claude-haiku-4-5");
+
+console.log("-- hasImageBlock: placement coverage --");
+const img = { type: "image", source: { type: "base64", media_type: "image/png", data: "AAA" } };
+const body = (obj) => Buffer.from(JSON.stringify(obj));
+eq("image in messages[].content", hasImageBlock(body({ model: "m", messages: [{ role: "user", content: [{ type: "text", text: "hi" }, img] }] })), true);
+eq("image in context[]", hasImageBlock(body({ model: "m", context: [img] })), true);
+eq("image in tool_result.content", hasImageBlock(body({ model: "m", messages: [{ role: "user", content: [{ type: "tool_result", content: [img] }] }] })), true);
+eq("nested arrays", hasImageBlock(body({ a: [[{ type: "text" }], [img]] })), true);
+
+console.log("-- hasImageBlock: negatives --");
+eq("no image anywhere", hasImageBlock(body({ model: "m", messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }] })), false);
+eq("prose mentions image", hasImageBlock(body({ model: "m", messages: [{ role: "user", content: [{ type: "text", text: "please describe this image" }] }] })), false);
+eq("image word in tool type", hasImageBlock(body({ model: "m", tools: [{ type: "image_editor" }] })), false);
+eq("non-JSON body", hasImageBlock(Buffer.from("not json")), false);
+eq("empty body", hasImageBlock(Buffer.alloc(0)), false);
+
+console.log("-- rewriteVision: model + effort, rest untouched --");
+const src = { model: "claude-deepseek-v4-flash[1m]", max_tokens: 100, stream: true, output_config: { effort: "high" }, messages: [{ role: "user", content: "x" }] };
+const rw = rewriteVision(body(src), "claude-opus-5", "low", "claude-deepseek-v4-flash[1m]");
+const out = JSON.parse(rw.body.toString("utf8"));
+eq("model swapped", out.model, "claude-opus-5");
+eq("effort forced", out.output_config.effort, "low");
+eq("max_tokens untouched", out.max_tokens, 100);
+eq("stream untouched", out.stream, true);
+eq("messages untouched", JSON.stringify(out.messages), JSON.stringify(src.messages));
+eq("clientModel echoed", rw.clientModel, "claude-deepseek-v4-flash[1m]");
+eq("absent output_config gains effort", JSON.parse(rewriteVision(body({ model: "m" }), "v", "low", "m").body.toString("utf8")).output_config.effort, "low");
+
+// The vision redirect answers on the Anthropic leg, whose upstream host is a bare
+// literal with no override (see scripts/test-auth-bridge.sh), so the echo is
+// asserted here on the same function that leg calls rather than through a server.
+console.log("-- restoreClientModel: the vision redirect echoes the display id --");
+const startEvent = (m) => `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","model":"${m}","role":"assistant"}}\n\n`;
+eq(
+  "opus-5 rewritten to the deepseek display id",
+  restoreClientModel(startEvent("claude-opus-5"), "claude-deepseek-v4-flash[1m]", "claude-opus-5"),
+  startEvent("claude-deepseek-v4-flash[1m]")
+);
+eq(
+  "prose naming the vision model is untouched",
+  restoreClientModel('data: {"text":"I used claude-opus-5 for this"}', "claude-deepseek-v4-flash[1m]", "claude-opus-5"),
+  'data: {"text":"I used claude-opus-5 for this"}'
+);
+eq("identical ids are a no-op", restoreClientModel(startEvent("claude-opus-5"), "claude-opus-5", "claude-opus-5"), startEvent("claude-opus-5"));
 
 console.log(fails ? `\n${fails} failing` : "\nall passing");
 process.exit(fails ? 1 : 0);
