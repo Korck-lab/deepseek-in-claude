@@ -162,6 +162,11 @@ printf '0.0.0-test\n' > "$PH/VERSION"
 # launcher's, not the model list's.
 cat > "$PH/proxy.mjs" <<'STUBPROXY'
 import http from "node:http";
+import fs from "node:fs";
+// The flags the launcher chose, for L6. Written from the proxy rather than read
+// off the process table because the launcher backgrounds it and nothing else in
+// this fixture can see the argv.
+if (process.env.CLAUDEI_PROXY_ARGV_DUMP) fs.writeFileSync(process.env.CLAUDEI_PROXY_ARGV_DUMP, process.argv.slice(2).join(" ") + "\n");
 http.createServer((req, res) => {
   if (req.url === "/_proxy/deepseek-models") {
     res.writeHead(200, { "content-type": "application/json" });
@@ -184,6 +189,8 @@ STUB
 chmod +x "$WORK/bin/claude"
 
 DUMP="$WORK/cli-env.dump"
+ARGV_DUMP="$WORK/proxy-argv.dump"
+CLAUDEI_PROXY_ARGV_DUMP="$ARGV_DUMP" \
 ANTHROPIC_API_KEY="sk-ant-exported-by-the-user" \
 ANTHROPIC_AUTH_TOKEN="real-bearer-exported-by-the-user" \
 HOME="$WORK/home" \
@@ -212,6 +219,12 @@ if [ -f "$DUMP" ]; then
   # silent feature loss rather than a crash. HOME is the isolated fixture.
   chk "L4 launcher seeded the gateway model cache" '[ -s "$WORK/home/.claude/cache/gateway-models.json" ]'
   chk "L5 cache baseUrl matches the exported base URL exactly" 'grep -q "\"baseUrl\":\"http://localhost:8899\"" "$WORK/home/.claude/cache/gateway-models.json" 2>/dev/null'
+  # ADR-0005. The launcher armed --fallback whenever config.yml said nothing about
+  # it, which put silent leg-crossing — DeepSeek credits spent on a turn aimed at
+  # Anthropic, reported under the Anthropic model — on every session of every
+  # project through the pooled proxy. Crossing is opt-in now, and opting in is
+  # config.yml's job, which the proxy reads itself.
+  chk "L6 launcher passes no --fallback" '! grep -q -- "--fallback" "$ARGV_DUMP" 2>/dev/null'
 else
   sed 's/^/      /' "$WORK/launcher.log" | tail -10
 fi

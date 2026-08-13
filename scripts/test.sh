@@ -373,10 +373,30 @@ else
   echo "FAIL T8 could not start proxy"
 fi
 
+# T8b the same proxy without --fallback must not cross legs. ADR-0005: --redir
+# used to imply fallback, so a dead DeepSeek quietly spent Anthropic plan traffic
+# — and the reverse spent DeepSeek credits on a 429 the user never saw. Crossing
+# is opt-in now, and a dead upstream is an error the user gets told about.
+if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:1" start_proxy 8017 --port 8017 --redir; then
+  O="$(curl -s --max-time 10 -X POST http://localhost:8017/v1/messages -H "content-type: application/json" \
+    -d '{"model":"sonnet","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}')"
+  check "T8b no --fallback: dead deepseek errors instead of crossing" 'echo "$O" | grep -q "deepseek upstream error"'
+else
+  echo "FAIL T8b could not start proxy"
+fi
+
 # T9 reverse fallback: anthropic 404 -> real deepseek
+# The usage log is append-only and outlives a run, so T9b reads only the lines
+# this run added — otherwise one passing run leaves a row that makes every later
+# run pass whether the tagging still works or not.
+USAGE_BEFORE="$( (wc -l < "$ROOT/logs/proxy-usage.jsonl") 2>/dev/null || echo 0)"
 if start_proxy 8006 --port 8006 --fallback; then
   O="$(cc 8006 --model claude-sonnet-4-5-fake "Reply with exactly: OK")"
   check "T9 fallback anthropic-404 -> deepseek" 'ok "$O"'
+  # The crossing that just happened spent DeepSeek credits on a turn aimed at
+  # Anthropic, and the response reports the Anthropic model. The usage log is the
+  # only place that says so, so it has to say so.
+  check "T9b the crossing is tagged in the usage log" 'tail -n "+$((USAGE_BEFORE + 1))" "$ROOT/logs/proxy-usage.jsonl" | grep -q "\"fallbackFrom\":\"anthropic\""'
 else
   echo "FAIL T9 could not start proxy"
 fi

@@ -63,11 +63,13 @@ sleep 1
 # fails on the code it was written against.
 cp "${PROXY_SRC:-$REPO/proxy.mjs}" "$WORK/proxy.mjs"
 : > "$WORK/.env"
-# --redir sends the Anthropic families to DeepSeek and implies --fallback, so a
-# claude-haiku request hits the stub first and falls back to Anthropic.
+# --redir sends the Anthropic families to DeepSeek; --fallback is what makes the
+# failed leg retry the other way, so a claude-haiku request hits the stub first
+# and falls back to Anthropic. Passed explicitly since ADR-0005 — --redir used to
+# imply it, and this suite is about the fallback path itself.
 DEEPSEEK_API_KEY=sk-stub DEEPSEEK_BASE_URL="http://127.0.0.1:$STUB_PORT" \
 UPSTREAM_TIMEOUT_MS="$TIMEOUT_MS" \
-  node "$WORK/proxy.mjs" --port "$PROXY_PORT" --redir >"$WORK/proxy.log" 2>&1 &
+  node "$WORK/proxy.mjs" --port "$PROXY_PORT" --redir --fallback >"$WORK/proxy.log" 2>&1 &
 PROXY_PID=$!
 sleep 2
 

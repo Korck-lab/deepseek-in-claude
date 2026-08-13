@@ -21,8 +21,14 @@ redir:
 
 # Bidirectional fallback: if the routed upstream fails (error/timeout/404/429/5xx),
 # retry the other way using the same redir relation — DeepSeek <-> Anthropic.
-# Implied by `--redir`; set false to disable.
-fallback: true
+#
+# Off by default, and worth understanding before turning on. A 429 from the
+# Anthropic leg is routine on a plan session, and a crossing sends that turn to
+# DeepSeek — metered credits — while the response still reports the Anthropic
+# model you asked for, so nothing on screen says it happened. One proxy serves
+# every project, so this setting applies to all of them at once. Crossings are
+# tagged `fallbackFrom` in logs/proxy-usage.jsonl. See docs/adr/0005.
+fallback: false
 
 # Idle-socket timeout for every upstream leg, in milliseconds (default 60000).
 # Streaming responses reset it on each chunk, so it bounds silence rather than

@@ -152,13 +152,15 @@ else
   SHA="$(cat "$PROXY_HOME/proxy.mjs" "$PROXY_HOME/config.yml" 2>/dev/null | sha256sum | cut -d' ' -f1)"
 fi
 
-# CLI flags win over config.yml inside the proxy, so passing --fallback
-# unconditionally would override an explicit `fallback: false`. Only supply it
-# when the config expresses no opinion.
+# No --fallback. The launcher used to arm it whenever config.yml expressed no
+# opinion, which made silent leg-crossing the default for everyone: an Anthropic
+# 429 rerouted the turn to DeepSeek, spending metered credits, and the response
+# still reported the Anthropic model. Worse here than in the proxy alone — one
+# pooled proxy serves every project, so a default set at launch applies to
+# sessions the person who launched it isn't even looking at. Opt in with
+# `fallback: true` in $PROXY_HOME/config.yml, which the proxy reads directly.
+# See ADR-0005.
 PROXY_FLAGS=""
-if ! grep -q '^fallback:' "$PROXY_HOME/config.yml" 2>/dev/null; then
-  PROXY_FLAGS="--fallback"
-fi
 
 if RUNNING_PID="$(proxy_pid)" && [ "$SHA" = "$(cat "$STAMP" 2>/dev/null)" ]; then
   echo "   proxy already running (pid $RUNNING_PID), reusing"

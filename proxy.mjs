@@ -107,7 +107,8 @@ Usage: node proxy.mjs [options]
   --redir           route Anthropic family models (haiku/sonnet/opus/fable) to
                     DeepSeek via the redir map (config.yml or built-in defaults)
   --fallback        on upstream failure retry the other way — DeepSeek <-> Anthropic,
-                    same redir relation, both directions
+                    same redir relation, both directions. Off unless asked for:
+                    it spends the other provider's quota without saying so
   --config PATH     YAML config file (default ./config.yml)
   --debug           log every request/response to /tmp/deepseek-proxy-payloads.jsonl
   --no-auth-bridge  do not substitute your Claude Code OAuth token for the
@@ -245,7 +246,16 @@ const DEFAULT_REDIR = {
 };
 
 const redirOn = ARGS.redir === true || Boolean(CFG.redir && typeof CFG.redir === "object");
-const FALLBACK = ARGS.fallback != null ? ARGS.fallback : CFG.fallback ?? redirOn;
+
+/** Opt-in, never inferred. Fallback crosses legs — an Anthropic 429, which is a
+ * routine event on a plan session, would otherwise reroute the turn to DeepSeek
+ * and spend metered credits the user never chose to spend. The swap is also
+ * invisible: `restoreClientModel` rewrites the response's `model` back to the id
+ * the client asked for, so the transcript reports the Anthropic model that never
+ * ran. Two silent effects at once is too much to arm by default, and the proxy is
+ * pooled across sessions, so whoever starts it arms it for every project at once.
+ * See ADR-0005. */
+const FALLBACK = ARGS.fallback != null ? ARGS.fallback : CFG.fallback ?? false;
 
 /** Relation map: family key -> DeepSeek model. Redirects when redirOn, and is
  * the fallback relation (both ways) when FALLBACK is set. */
@@ -839,7 +849,13 @@ function decodeSse(raw) {
 // DeepSeek routing — transparent passthrough to the Anthropic-compatible API
 // ---------------------------------------------------------------------------
 
-function handleDeepSeek(req, res, body, reqPath, redir) {
+/** `opts.fallbackFrom` names the leg that gave up on this turn, when the turn
+ * only reached DeepSeek because the Anthropic leg failed. It exists for the usage
+ * log: a fallback spends DeepSeek credits on a request the user aimed at
+ * Anthropic, and without the tag those rows are indistinguishable from deliberate
+ * DeepSeek use — which is exactly the question asked after the fact. Same reason
+ * the vision redirect threads `opts.redirected`. */
+function handleDeepSeek(req, res, body, reqPath, redir, opts = {}) {
   if (isTokenCount(reqPath)) {
     const est = estTokens(body.length);
     res.writeHead(200, { "content-type": "application/json" });
@@ -933,7 +949,7 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
           up.resume(); // drain so the socket frees
           handedOff = true;
           clearUpstreamTimeout();
-          void forwardToAnthropic(req, res, reqPath, body, null).catch((err) => sendError(res, 502, "api_error", err.message)); // original model + body
+          void forwardToAnthropic(req, res, reqPath, body, null, { fallbackFrom: "deepseek" }).catch((err) => sendError(res, 502, "api_error", err.message)); // original model + body
           return;
         }
         if (status === 200) {
@@ -966,7 +982,7 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
             head = null;
             clearUpstreamTimeout();
             res.end();
-            logUsage({ method: req.method, path: reqPath, status, ms: Date.now() - started, model: sentModel, usage: decodeSse(Buffer.concat(respChunks).toString("utf8")) });
+            logUsage({ method: req.method, path: reqPath, status, ms: Date.now() - started, model: sentModel, usage: decodeSse(Buffer.concat(respChunks).toString("utf8")), fallbackFrom: opts.fallbackFrom });
           });
           return;
         }
@@ -1003,7 +1019,7 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
           clearUpstreamTimeout();
           res.writeHead(status, cleanResponseHeaders(up.headers));
           res.end(raw);
-          logUsage({ method: req.method, path: reqPath, status, ms: Date.now() - started, model: sentModel, usage: null });
+          logUsage({ method: req.method, path: reqPath, status, ms: Date.now() - started, model: sentModel, usage: null, fallbackFrom: opts.fallbackFrom });
         });
       }
     );
@@ -1016,8 +1032,13 @@ function handleDeepSeek(req, res, body, reqPath, redir) {
       if (res.headersSent) { res.destroy(); return; }
       if (FALLBACK && redir) {
         handedOff = true;
-        void forwardToAnthropic(req, res, reqPath, body, null).catch((e) => sendError(res, 502, "api_error", e.message));
+        void forwardToAnthropic(req, res, reqPath, body, null, { fallbackFrom: "deepseek" }).catch((e) => sendError(res, 502, "api_error", e.message));
         return;
+      }
+      // Mirror of the same case on the Anthropic leg: a crossing that then failed
+      // still belongs in the ledger.
+      if (opts.fallbackFrom) {
+        logUsage({ method: req.method, path: reqPath, status: 502, ms: Date.now() - started, model: sentModel, usage: null, fallbackFrom: opts.fallbackFrom, error: err.message });
       }
       sendError(res, 502, "api_error", `deepseek upstream error: ${err.message}`);
     });
@@ -1122,6 +1143,15 @@ function restoreClientModel(text, clientModel, realModel) {
   );
 }
 
+/** The `model` a forwarded body actually carries, for the usage log. */
+function sentModelOf(body) {
+  try {
+    return JSON.parse(body.toString("utf8"))?.model ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function rewriteModel(body, model) {
   try {
     const j = JSON.parse(body.toString("utf8"));
@@ -1147,7 +1177,7 @@ async function forwardToAnthropic(req, res, reqPath, body, fb, opts = {}) {
         up.resume(); // drain so the socket frees
         handedOff = true;
         clearUpstreamTimeout();
-        handleDeepSeek(req, res, rewriteModel(body, fb.mapped), reqPath, null);
+        handleDeepSeek(req, res, rewriteModel(body, fb.mapped), reqPath, null, { fallbackFrom: "anthropic" });
         return;
       }
       res.writeHead(status, cleanResponseHeaders(up.headers));
@@ -1188,10 +1218,28 @@ async function forwardToAnthropic(req, res, reqPath, body, fb, opts = {}) {
         });
         return;
       }
-      up.on("data", (c) => res.write(c));
+      // A plain Anthropic turn is the user's own plan traffic and stays out of
+      // the usage log — that log is the DeepSeek spend ledger. A turn that got
+      // here because the DeepSeek leg gave up is the exception: it is the
+      // counterpart of the rows tagged `fallbackFrom: "anthropic"`, and reading
+      // the ledger without it shows crossings in one direction only.
+      const fallbackChunks = opts.fallbackFrom ? [] : null;
+      up.on("data", (c) => {
+        fallbackChunks?.push(c);
+        res.write(c);
+      });
       up.on("end", () => {
         clearUpstreamTimeout();
         res.end();
+        if (fallbackChunks) {
+          logUsage({
+            method: req.method, path: reqPath, status,
+            ms: Date.now() - started,
+            model: sentModelOf(body),
+            usage: status === 200 ? decodeSse(Buffer.concat(fallbackChunks).toString("utf8")) : null,
+            fallbackFrom: opts.fallbackFrom,
+          });
+        }
       });
     }
   );
@@ -1201,8 +1249,14 @@ async function forwardToAnthropic(req, res, reqPath, body, fb, opts = {}) {
     if (res.headersSent) { res.destroy(); return; }
     if (FALLBACK && fb) {
       handedOff = true;
-      handleDeepSeek(req, res, rewriteModel(body, fb.mapped), reqPath, null);
+      handleDeepSeek(req, res, rewriteModel(body, fb.mapped), reqPath, null, { fallbackFrom: "anthropic" });
       return;
+    }
+    // A crossing that then failed is still a crossing, and the ledger is where
+    // the user goes to find out what happened to a turn. Without this row the
+    // record shows only the crossings that worked.
+    if (opts.fallbackFrom) {
+      logUsage({ method: req.method, path: reqPath, status: 502, ms: Date.now() - started, model: sentModelOf(body), usage: null, fallbackFrom: opts.fallbackFrom, error: err.message });
     }
     sendError(res, 502, "api_error", `agent-proxy upstream error: ${err.message}`);
   });

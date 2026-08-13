@@ -57,7 +57,11 @@ someone setting `ANTHROPIC_AUTH_TOKEN` deliberately, not the default one.
 (haiku/sonnet/opus/fable) to DeepSeek via a mapping. Distinct from *fallback*.
 
 **Fallback** — the `--fallback` mode that retries the *other* leg when an upstream
-returns 404/429/5xx. Bidirectional.
+returns 404/429/5xx. Bidirectional, and **off unless asked for** — it spends the other
+provider's quota, and `restoreClientModel` means the response still names the model
+that never ran, so the crossing is invisible at the time. Opt in with `fallback: true`
+in `$PROXY_HOME/config.yml`; the launcher passes no flag. Crossings are tagged
+`fallbackFrom` in the usage log. See ADR-0005.
 
 **Vision redirect** — the reroute of a request carrying an image block away from a
 vision-less model (DeepSeek V4 has no vision) to a vision-capable Anthropic model

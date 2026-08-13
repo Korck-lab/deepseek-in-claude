@@ -123,7 +123,7 @@ Any Claude Code flag or env var applies there. If you prefer not to use it, the 
 
 A few environment variables steer the launcher itself: `DEEPSEEK_IN_CLAUDE_HOME` (checkout location), `DEEPSEEK_PROXY_PORT` (listen port), `CLAUDE` (path to the CLI), and `CLAUDEI_SKIP_PERMISSIONS`. Its pid file, launch fingerprint and proxy log live together in a per-user `$TMPDIR/deepseek-in-claude-$UID` directory created mode `0700`.
 
-`--fallback` is passed only when `config.yml` says nothing about `fallback:` — CLI flags win over the config file inside the proxy, so passing it unconditionally would override an explicit `fallback: false`.
+The launcher passes no `--fallback`. It used to arm it whenever `config.yml` said nothing about `fallback:`, which made silent leg-crossing the default for every project through the shared proxy — see [Redirect & fallback](#redirect--fallback) and ADR-0005. Turn it on in `$PROXY_HOME/config.yml` if you want it.
 
 Three env vars earlier versions of this launcher set have been dropped — they were measured against Claude Code 2.1.228 and do not do what their names suggest:
 
@@ -176,6 +176,8 @@ Don't want the proxy near your credentials at all? Skip discovery and pass `--mo
 
 `--fallback` retries the other way when the routed upstream fails — error, timeout, or `404` / `429` / `5xx`. A redirected `sonnet` call that DeepSeek fails falls back to real Anthropic `sonnet`; a direct Anthropic call that fails falls back to its DeepSeek counterpart. Same relation map, both directions, one retry.
 
+**It is off unless you ask for it, and it is worth knowing why before you do.** A `429` from the Anthropic leg is routine on a plan session, and a crossing sends that turn to DeepSeek — metered credits. The response still reports the model you asked for, because the `model` field is what a resumed session restores its context window from (ADR-0001), so nothing on screen tells you the swap happened. One proxy serves every project at once, so the setting is global by construction. Crossings are tagged `fallbackFrom` in `logs/proxy-usage.jsonl`; that log is the only record. See ADR-0005.
+
 ```bash
 node proxy.mjs --redir --fallback
 ```
@@ -189,7 +191,7 @@ redir:
   sonnet: deepseek-v4-flash
   opus: deepseek-v4-flash
   fable: deepseek-v4-pro
-fallback: true
+fallback: false
 debug: false
 effort:
   medium: high
