@@ -422,18 +422,16 @@ let refreshInFlight = null;
 //
 // DeepSeek V4 models have no vision; a request carrying an image block 400s
 // upstream. When the resolved target model lacks vision capability, such a
-// request is rerouted to a vision-capable Anthropic model instead (see the
-// Vision capability map section). On by default — the alternative is a hard 400 —
-// and it only costs Anthropic plan traffic when an image actually appears.
+// request is rerouted to a local vision model instead (see the Vision capability
+// map section) — LM Studio by default, which speaks OpenAI protocol, so this leg
+// translates Anthropic <-> OpenAI rather than reusing the Anthropic upstream.
+// On by default — the alternative is a hard 400. No plan traffic: this leg never
+// touches api.anthropic.com, so an image turn costs nothing but local inference.
 // ---------------------------------------------------------------------------
 
 const VISION_REDIRECT = CFG.vision?.redirect !== false;
-const VISION_MODEL = CFG.vision?.model ?? "claude-opus-5";
-const VISION_EFFORT = CFG.vision?.effort ?? "low";
-
-if (VISION_REDIRECT && !AUTH_BRIDGE) {
-  warnOnce(`vision redirect is on but the credential bridge is off — redirected image requests to ${VISION_MODEL} will answer 401`, "vision");
-}
+const VISION_MODEL = CFG.vision?.model ?? "prism-ml/bonsai-27b";
+const VISION_BASE_URL = CFG.vision?.baseUrl ?? "http://127.0.0.1:1234";
 
 function warnOnce(message, scope = "auth-bridge") {
   if (credWarned.has(message)) return;
@@ -1181,43 +1179,6 @@ async function forwardToAnthropic(req, res, reqPath, body, fb, opts = {}) {
         return;
       }
       res.writeHead(status, cleanResponseHeaders(up.headers));
-      if (status === 200 && opts.restoreModel) {
-        // Answer in the client's vocabulary: `message_start` reports the model
-        // actually sent upstream, and a resumed session restores its model from
-        // that field — so a redirected turn must echo the client's display id,
-        // not the vision model. Hold bytes only until the first SSE event is
-        // complete, rewrite the `model` field, stream the rest. Mirror of the
-        // head-buffering in handleDeepSeek; only the redirect leg needs it, a
-        // plain Anthropic passthrough streams straight through.
-        const respChunks = [];
-        let head = Buffer.alloc(0);
-        up.on("data", (c) => {
-          respChunks.push(c);
-          if (head === null) { res.write(c); return; }
-          head = Buffer.concat([head, c]);
-          const text = head.toString("utf8");
-          const end = text.indexOf("\n\n");
-          if (end === -1 && head.length < 65536) return;
-          res.write(Buffer.from(restoreClientModel(text, opts.restoreModel, opts.realModel), "utf8"));
-          head = null;
-        });
-        up.on("end", () => {
-          // A response that ended before its first event boundary — short,
-          // non-SSE, or truncated — still has to reach the client.
-          if (head !== null && head.length > 0) {
-            res.write(Buffer.from(restoreClientModel(head.toString("utf8"), opts.restoreModel, opts.realModel), "utf8"));
-          }
-          head = null;
-          clearUpstreamTimeout();
-          res.end();
-          // Redirected turns bill Anthropic plan traffic; make them visible in
-          // the usage log or they read as missing.
-          if (opts.redirected) {
-            logUsage({ method: req.method, path: reqPath, status, ms: Date.now() - started, model: opts.realModel, usage: decodeSse(Buffer.concat(respChunks).toString("utf8")), redirected: opts.redirected });
-          }
-        });
-        return;
-      }
       // A plain Anthropic turn is the user's own plan traffic and stays out of
       // the usage log — that log is the DeepSeek spend ledger. A turn that got
       // here because the DeepSeek leg gave up is the exception: it is the
@@ -1289,14 +1250,215 @@ function hasImageBlock(bodyBuf) {
   return walk(root);
 }
 
-/** Rewrite an image-bearing request for the vision-capable leg: swap the model,
- * force the configured effort, keep everything else. `clientModel` is the id the
- * response must echo so a resumed session keeps its display model. */
-function rewriteVision(bodyBuf, model, effort, clientModel) {
+/** Translate an Anthropic-format request body into OpenAI chat.completions
+ * format for the local vision leg (LM Studio). The two schemas differ in the
+ * message shape, the image encoding, the tool schema and the effort field:
+ *
+ * - `system` (string or array of text blocks) becomes a leading system message.
+ * - `messages[].content` blocks map per type: text stays text; an image block
+ *   becomes OpenAI's `image_url` (base64 data URI, or passthrough URL); a
+ *   `tool_result` becomes an OpenAI tool-role message keyed by `tool_use_id`;
+ *   a `tool_use` becomes an OpenAI assistant `tool_calls` entry.
+ * - `tools` become OpenAI function tools; advisor_* variants are dropped, the
+ *   same rule the DeepSeek leg applies, because a local model cannot know them.
+ * - `output_config.effort` is dropped — OpenAI has no effort concept, and the
+ *   local model's own temperature comes from its LM Studio model.yaml.
+ * - `stream`, `max_tokens`, `temperature`, `top_p`, `stop_sequences` survive.
+ *
+ * Only image-bearing requests reach this path (the redirect gate runs first),
+ * so the image_url mapping is the load-bearing piece; everything else is
+ * fidelity for the surrounding conversation. */
+function anthropicToOpenAI(bodyBuf, model) {
   const j = JSON.parse(bodyBuf.toString("utf8"));
-  j.model = model;
-  if (effort) j.output_config = { ...(j.output_config ?? {}), effort };
-  return { body: Buffer.from(JSON.stringify(j)), clientModel };
+  const messages = [];
+  if (j.system) {
+    const sysText = Array.isArray(j.system)
+      ? j.system.map((b) => (b?.type === "text" ? b.text : "")).join("")
+      : String(j.system);
+    if (sysText) messages.push({ role: "system", content: sysText });
+  }
+  for (const m of j.messages ?? []) {
+    const role = m.role ?? "user";
+    const content = m.content;
+    if (typeof content === "string") {
+      messages.push({ role, content });
+      continue;
+    }
+    if (!Array.isArray(content)) continue;
+    const parts = [];
+    let toolCalls = null;
+    const tools = [];
+    for (const b of content) {
+      if (!b || typeof b !== "object") continue;
+      switch (b.type) {
+        case "text":
+          parts.push({ type: "text", text: b.text ?? "" });
+          break;
+        case "image": {
+          const src = b.source ?? {};
+          if (src.type === "base64") {
+            parts.push({ type: "image_url", image_url: { url: `data:${src.media_type ?? "image/png"};base64,${src.data ?? ""}` } });
+          } else if (src.type === "url" && src.url) {
+            parts.push({ type: "image_url", image_url: { url: src.url } });
+          }
+          break;
+        }
+        case "tool_use":
+          (toolCalls ??= []).push({
+            id: b.id,
+            type: "function",
+            function: { name: b.name ?? "", arguments: JSON.stringify(b.input ?? {}) },
+          });
+          break;
+        case "tool_result": {
+          const r = b.content;
+          const text = typeof r === "string" ? r : Array.isArray(r) ? r.map((x) => (x?.type === "text" ? x.text : "")).join("") : "";
+          tools.push({ role: "tool", tool_call_id: b.tool_use_id ?? "", content: text });
+          break;
+        }
+        default:
+          break;
+      }
+    }
+    if (role === "assistant") {
+      messages.push({ role, ...(parts.length ? { content: parts } : {}), ...(toolCalls ? { tool_calls: toolCalls } : {}) });
+    } else if (role === "user") {
+      if (parts.length) messages.push({ role, content: parts });
+      messages.push(...tools);
+    } else {
+      messages.push({ role, content: parts.length ? parts : "" });
+    }
+  }
+  const out = { model, messages, stream: j.stream ?? true };
+  if (j.max_tokens) out.max_tokens = j.max_tokens;
+  if (j.temperature !== undefined) out.temperature = j.temperature;
+  if (j.top_p !== undefined) out.top_p = j.top_p;
+  if (Array.isArray(j.stop_sequences)) out.stop = j.stop_sequences;
+  if (Array.isArray(j.tools)) {
+    const fnTools = j.tools
+      .filter((t) => !(t && typeof t.type === "string" && /^advisor_/.test(t.type)))
+      .map((t) => ({ type: "function", function: { name: t.name ?? "", description: t.description ?? "", parameters: t.input_schema ?? {} } }));
+    if (fnTools.length) out.tools = fnTools;
+  }
+  return out;
+}
+
+/** Forward an image-bearing request to the local vision model (LM Studio).
+ *
+ * The leg speaks OpenAI chat.completions, so it translates twice: the request
+ * body through anthropicToOpenAI, and the streamed response back into the
+ * Anthropic SSE events Claude Code expects. The response answers in the client's
+ * vocabulary — message_start carries the display id the normal DeepSeek path
+ * would have echoed, not the local model's id — so a resumed session keeps its
+ * display model (ADR-0001, applied here exactly as the Anthropic redirect did).
+ *
+ * The redirect is the fix, not a stage in the fallback chain: `fb` stays null,
+ * so a failure on this leg surfaces as an error rather than re-sending the image
+ * to the vision-less model. */
+function forwardToLocalVision(req, res, reqPath, body, clientModel) {
+  let openaiBody;
+  try {
+    openaiBody = Buffer.from(JSON.stringify(anthropicToOpenAI(body, VISION_MODEL)));
+  } catch (err) {
+    sendError(res, 400, "api_error", `vision request could not be translated: ${err.message}`);
+    return;
+  }
+  let u;
+  try {
+    u = new URL(VISION_BASE_URL);
+  } catch (err) {
+    sendError(res, 500, "api_error", `vision baseUrl is invalid: ${err.message}`);
+    return;
+  }
+  const started = Date.now();
+  const lib = u.protocol === "https:" ? https : http;
+  const path = `${u.pathname.replace(/\/+$/, "")}/v1/chat/completions`;
+  const headers = {
+    "content-type": "application/json",
+    "content-length": String(openaiBody.length),
+    accept: "text/event-stream",
+  };
+  const upstream = lib.request(
+    { hostname: u.hostname, port: u.port || (u.protocol === "https:" ? 443 : 80), path, method: "POST", headers },
+    (up) => {
+      const status = up.statusCode ?? 502;
+      if (status !== 200) {
+        const chunks = [];
+        up.on("data", (c) => chunks.push(c));
+        up.on("end", () => {
+          const raw = Buffer.concat(chunks).toString("utf8");
+          sendError(res, status >= 500 ? 502 : status, "api_error", `local vision model error (${status}): ${raw.slice(0, 200)}`);
+          logUsage({ method: req.method, path: reqPath, status, ms: Date.now() - started, model: VISION_MODEL, usage: null, redirected: { to: VISION_MODEL, reason: "vision" }, error: raw.slice(0, 200) });
+        });
+        return;
+      }
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+      // Synthesize the Anthropic envelope. message_start carries the client's
+      // display id so the restore contract holds; usage is estimated, since
+      // OpenAI's stream does not carry Anthropic-shaped usage unless asked.
+      const estIn = estTokens(body.length);
+      const msgId = `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+      res.write(`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: msgId, type: "message", role: "assistant", model: clientModel, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: estIn, output_tokens: 0 } } })}\n\n`);
+      res.write('event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n');
+
+      let buf = "";
+      let outChars = 0;
+      let wroteDelta = false;
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        clearUpstreamTimeout();
+        res.write('event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n');
+        res.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: Math.round(outChars / 4) } })}\n\n`);
+        res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+        res.end();
+        logUsage({ method: req.method, path: reqPath, status, ms: Date.now() - started, model: VISION_MODEL, usage: { input_tokens: estIn, output_tokens: Math.round(outChars / 4) }, redirected: { to: VISION_MODEL, reason: "vision" } });
+      };
+      up.setEncoding("utf8");
+      up.on("data", (chunk) => {
+        buf += chunk;
+        let idx;
+        while ((idx = buf.indexOf("\n")) !== -1) {
+          const line = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 1);
+          const m = line.match(/^data:\s?(.*)$/);
+          if (!m || m[1] === "[DONE]") continue;
+          let evt;
+          try {
+            evt = JSON.parse(m[1]);
+          } catch {
+            continue;
+          }
+          const delta = evt.choices?.[0]?.delta;
+          const text = delta && typeof delta.content === "string" ? delta.content : null;
+          if (text) {
+            outChars += text.length;
+            wroteDelta = true;
+            res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })}\n\n`);
+          }
+          const fr = evt.choices?.[0]?.finish_reason;
+          if (fr) finish();
+        }
+      });
+      up.on("end", () => {
+        // A response that ended before emitting finish_reason — short, truncated,
+        // or non-SSE — still has to reach the client as a complete message.
+        if (!wroteDelta && buf.trim()) {
+          res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: buf.trim() } })}\n\n`);
+        }
+        finish();
+      });
+    }
+  );
+  const clearUpstreamTimeout = () => upstream.setTimeout(0);
+  upstream.setTimeout(UPSTREAM_TIMEOUT, () => upstream.destroy(new Error("upstream timeout")));
+  upstream.on("error", (err) => {
+    if (res.headersSent) { res.destroy(); return; }
+    sendError(res, 502, "api_error", `local vision model unreachable (${VISION_BASE_URL}): ${err.message}`);
+  });
+  upstream.write(openaiBody);
+  upstream.end();
 }
 
 // ---------------------------------------------------------------------------
@@ -1354,12 +1516,7 @@ function handle(req, res) {
         // on the user — the same failure ADR-0004 redirects to avoid, pointed
         // the other way.
         const echo = dsReal ? displayIdOf(dsReal) : model;
-        const { body: vBody, clientModel } = rewriteVision(body, VISION_MODEL, VISION_EFFORT, echo);
-        void forwardToAnthropic(req, res, reqPath, vBody, null, {
-          restoreModel: clientModel,
-          realModel: VISION_MODEL,
-          redirected: { to: VISION_MODEL, reason: "vision", effort: VISION_EFFORT },
-        }).catch((err) => sendError(res, 502, "api_error", err.message));
+        forwardToLocalVision(req, res, reqPath, body, echo);
         return;
       }
       if (model && deepseekRealId(model)) {

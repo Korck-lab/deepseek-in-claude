@@ -21,7 +21,10 @@ PORT=8897
 
 cleanup() {
   # Any launcher still running would otherwise outlive the suite holding the port.
-  pkill -f "proxy\.mjs" 2>/dev/null | true
+  # Scope the kill to this suite's stub proxy under $WORK: the live pooled proxy
+  # (claudei.sh runs it from $PROXY_HOME/proxy.mjs, never under $WORK) matches
+  # a bare "proxy\.mjs" and must not be killed by a dev test run.
+  pkill -f "$WORK/ph/proxy\.mjs" 2>/dev/null | true
   rm -rf "$WORK"
 }
 trap cleanup EXIT INT TERM
@@ -97,6 +100,27 @@ mkdir -p "$SESSION_DIR"
 bash "$REPO/claudei.sh" >"$WORK/s3.log" 2>&1
 chk "P5 stale lease does not keep the proxy alive" '! port_open'
 chk "P6 stale lease file was pruned" '[ ! -e "$SESSION_DIR/999999" ]'
+
+# --- P7: cleanup must not kill a proxy the suite did not start ----------------
+# The cleanup trap used `pkill -f "proxy\.mjs"` — any process whose command line
+# contains proxy.mjs, which includes the developer's own pooled proxy at
+# ~/.deepseek-in-claude/proxy.mjs. Running this suite then killed a live session
+# mid-response. The kill must be scoped to the stub proxy under $WORK: a foreign
+# proxy at another path must survive the cleanup.
+DECOY_DIR="$(mktemp -d)"
+cat > "$DECOY_DIR/proxy.mjs" <<'DECOY'
+import http from "node:http";
+http.createServer((req, res) => { res.writeHead(200).end(); })
+  .listen(Number(process.env.PORT) || 8898, "127.0.0.1");
+DECOY
+PORT=8898 nohup node "$DECOY_DIR/proxy.mjs" >/dev/null 2>&1 &
+DECOY_PID=$!
+i=0; while [ "$i" -lt 60 ] && ! lsof -nP -tiTCP:8898 -sTCP:LISTEN >/dev/null 2>&1; do i=$((i + 1)); sleep 0.2; done
+cleanup
+kill -0 "$DECOY_PID" 2>/dev/null
+chk "P7 cleanup spares a proxy outside the suite's dir" 'kill -0 '"$DECOY_PID"' 2>/dev/null'
+kill "$DECOY_PID" 2>/dev/null
+rm -rf "$DECOY_DIR"
 
 echo ""
 if [ "$FAILS" -ne 0 ]; then

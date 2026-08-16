@@ -34,7 +34,7 @@ Then run `claudei` from anywhere and pick a model with `/model`.
 - **Anthropic auth stays yours, and connectors keep working** — `claudei.sh` sets no Anthropic auth environment variable at all. It writes Claude Code's gateway model cache itself, which is what the `/model` picker actually reads, so nothing has to be authenticated to get DeepSeek listed. Your claude.ai login authenticates Anthropic models as usual, and because no auth variable is set, claude.ai connectors stay enabled. See [Anthropic credential bridge](#anthropic-credential-bridge).
 - **Real 1M context** — DeepSeek V4's window is 1M tokens, but Claude Code assumes 200k for any model it doesn't know. The proxy advertises the display id with Claude Code's `[1m]` marker, so the status line and auto-compact use the real window.
 - **Effort passthrough** — DeepSeek V4 accepts all five Claude Code effort levels (`low|medium|high|xhigh|max`) natively, so nothing is rewritten by default. The `effort` block in `config.yml` is there to remap specific levels if you want.
-- **Paste a screenshot and it still works** — DeepSeek V4 can't see images, so an image in your prompt would come back a hard 400. The proxy spots the image before dispatch and sends that one turn to a model that can see (`claude-opus-5` at `low` effort by default), then answers as the model you picked — so the next turn is back on DeepSeek and your 1M window is intact. Tune it in the `vision:` block, or tell the proxy which models can see with `capabilities:`. See ADR-0004.
+- **Paste a screenshot and it still works** — DeepSeek V4 can't see images, so an image in your prompt would come back a hard 400. The proxy spots the image before dispatch and sends that one turn to a local vision model instead — LM Studio by default (`prism-ml/bonsai-27b`), so no Anthropic plan traffic is spent on images — then answers as the model you picked, so the next turn is back on DeepSeek and your 1M window is intact. Point `vision.baseUrl` at your server and `vision.model` at a vision-capable id, or tell the proxy which models can see with `capabilities:`. See ADR-0004.
 - **Instant `count_tokens`** — Claude Code's housekeeping call is answered locally with a fast estimate instead of hitting an undocumented endpoint.
 - **Model aliases** — short names (`v4flash`, `v4-flash`, `v4pro`, `v4-pro`) are normalized to their `deepseek-*` ids wherever you configure models.
 - **Usage observability** — every DeepSeek request appends one JSON line with the real input/cache/output token counts to `logs/proxy-usage.jsonl`. Message content and auth headers are never logged.
@@ -198,8 +198,8 @@ effort:
   xhigh: max
 vision:
   redirect: true
-  model: claude-opus-5
-  effort: low
+  baseUrl: http://127.0.0.1:1234
+  model: prism-ml/bonsai-27b
 capabilities:
   deepseek-v4-flash:
     vision: false
@@ -207,7 +207,7 @@ capabilities:
 
 The `effort` block is opt-in: DeepSeek V4 accepts all five Claude Code effort levels natively, so nothing is remapped unless you list a level here.
 
-The `vision` block is on by default — an image turn has to go somewhere, and failing is the worse answer. Set `redirect: false` to keep every turn on DeepSeek and let image requests fail upstream. `capabilities` is the escape hatch for models whose provider doesn't advertise what they can do: anything you mark `vision: true` there is never redirected, and Anthropic's own models are read straight from its model list.
+The `vision` block is on by default — an image turn has to go somewhere, and failing is the worse answer. It routes image turns to a local vision model: `baseUrl` is your OpenAI-compatible local server (LM Studio by default) and `model` the vision-capable id it reports. Set `redirect: false` to keep every turn on DeepSeek and let image requests fail upstream. `capabilities` is the escape hatch for models whose provider doesn't advertise what they can do: anything you mark `vision: true` there is never redirected, and Anthropic's own models are read straight from its model list.
 
 ## Configuration
 

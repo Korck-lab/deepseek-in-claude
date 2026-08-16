@@ -49,14 +49,15 @@ effort:
 
 # Route image-bearing requests away from vision-less models.
 # DeepSeek V4 has no vision, so an image block in a request 400s upstream. When
-# the target model lacks vision capability, the request is rerouted to a
-# vision-capable Anthropic model (claude-opus-5, effort low) by default. On
-# costs Anthropic plan traffic only when an image actually appears; off leaves
-# image turns to fail upstream. See ADR-0004.
+# the target model lacks vision capability, the request is rerouted to a local
+# vision model — LM Studio by default, which speaks OpenAI protocol, so this leg
+# translates Anthropic <-> OpenAI. No Anthropic plan traffic: an image turn costs
+# only local inference. baseUrl is the LM Studio server; model is the id it
+# reports on /v1/models. Off leaves image turns to fail upstream. See ADR-0004.
 vision:
   redirect: true
-  model: claude-opus-5
-  effort: low
+  baseUrl: http://127.0.0.1:1234
+  model: prism-ml/bonsai-27b
 
 # Per-model capability overrides, for providers that don't report them.
 # Wins over both the per-family default and any value fetched from /v1/models.

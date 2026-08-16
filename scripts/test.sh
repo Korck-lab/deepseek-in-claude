@@ -33,6 +33,23 @@ check() { # check NAME CONDITION
 
 start_proxy() { # start_proxy WAIT_PORT [node args...]
   local p="$1"; shift
+  # ADR-0006 — the suite must never bind 8016, the live pooled proxy's port.
+  # A test proxy there either adopts the launcher's role (cleanup then kills
+  # every session on it, including this one) or silently tests the live proxy.
+  # Guard here: a start that names no --port and no --config relies on the
+  # proxy's default, which is 8016 — refuse it loudly instead of dropping a
+  # session. (--config is allowed: the config file names its own port.)
+  if [ "$p" = "8016" ]; then
+    echo "FAIL start_proxy: wait port 8016 is the live proxy's port (ADR-0006)" >&2
+    return 1
+  fi
+  case " $* " in
+    *" --port "*|*" --config "*) ;;
+    *)
+      echo "FAIL start_proxy: no --port or --config, proxy would bind its default 8016 (ADR-0006)" >&2
+      return 1
+      ;;
+  esac
   node "$ROOT/proxy.mjs" "$@" >/dev/null 2>&1 &
   PIDS+=("$!")
   # Counted loop rather than `seq`, which is not POSIX and is absent on some
@@ -77,6 +94,23 @@ http.createServer((req, res) => {
       advisor = Array.isArray(j.tools) && j.tools.some((t) => /^advisor_/.test(t.type ?? ""));
       future = Array.isArray(j.tools) && j.tools.some((t) => t.type === "web_search_20260401");
     } catch {}
+    // OpenAI-shaped route for the local vision leg (ADR-0004: LM Studio). The
+    // proxy translates Anthropic <-> OpenAI, so this mock answers with OpenAI
+    // chat.completions SSE and the assertion reads the translated Anthropic SSE
+    // the client receives. Echo the model the proxy sent (proof the rewrite
+    // reached the leg) — a mock that never sees it also never reports it.
+    if (req.url.includes("/v1/chat/completions")) {
+      const seenModel = JSON.parse(Buffer.concat(chunks).toString("utf8")).model ?? "?";
+      const oai = (d) => `data: ${JSON.stringify({ id: "chatcmpl-mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: d, finish_reason: null }] })}\n\n`;
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(
+        oai({ role: "assistant", content: `LOCAL_VISION:${seenModel} ` })
+        + oai({ content: "OK" })
+        + `data: ${JSON.stringify({ id: "chatcmpl-mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`
+        + "data: [DONE]\n\n"
+      );
+      return;
+    }
     if (advisor) {
       res.writeHead(400, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: "Failed to deserialize the JSON body into the target type: tools[249]: unknown variant `advisor_20260301`, expected `web_search_20250305` or `web_search_20260209` at line 1 column 393737", type: "invalid_request_error", param: null, code: "invalid_request_error" } }));
@@ -162,9 +196,12 @@ echo "    claude: $CLAUDE ($("$CLAUDE" --version 2>/dev/null | head -1))"
 H="$(node "$ROOT/proxy.mjs" --help)"
 check "T1 --help lists flags" 'echo "$H" | grep -q -- "--port" && echo "$H" | grep -q -- "--redir" && echo "$H" | grep -q -- "--fallback" && echo "$H" | grep -q -- "--no-auth-bridge"'
 
-# T2/T3/T4 default config (port 8016)
-if start_proxy 8016; then
-  M="$(curl -s --max-time 15 http://localhost:8016/v1/models)"
+# T2/T3/T4 default config. ADR-0006: the suite never binds 8016, the live
+# pooled proxy's port — a test proxy there either adopts the launcher's role
+# (and cleanup kills every session on it) or silently tests the live proxy.
+# The default config is exercised on a scratch port instead.
+if start_proxy 8015 --port 8015; then
+  M="$(curl -s --max-time 15 http://localhost:8015/v1/models)"
   check "T2 /v1/models has deepseek ids" 'echo "$M" | grep -q "deepseek-v4-flash"'
   check "T2c display ids carry the [1m] window marker" 'echo "$M" | grep -q "claude-deepseek-v4-flash\[1m\]"'
   # Must not match the `claude-deepseek-*` display ids — look for a real one.
@@ -174,13 +211,13 @@ if start_proxy 8016; then
     echo "SKIP T2b anthropic merge (upstream fetch unauthenticated)"
   fi
 
-  CT="$(curl -s --max-time 5 -X POST http://localhost:8016/v1/messages/count_tokens -H "content-type: application/json" -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hello"}]}')"
+  CT="$(curl -s --max-time 5 -X POST http://localhost:8015/v1/messages/count_tokens -H "content-type: application/json" -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hello"}]}')"
   check "T3 count_tokens local estimate" 'echo "$CT" | grep -q "input_tokens"'
 
-  O="$(cc 8016 --model deepseek-v4-flash "Reply with exactly: OK")"
+  O="$(cc 8015 --model deepseek-v4-flash "Reply with exactly: OK")"
   check "T4 default config cc -p deepseek model" 'ok "$O"'
 else
-  echo "FAIL T2-T4 could not start proxy on 8016"
+  echo "FAIL T2-T4 could not start proxy on 8015"
 fi
 
 # T5 --port flag
@@ -282,8 +319,7 @@ fi
 # prove the gates against the mock. 1x1 transparent PNG so the real model accepts
 # the image.
 PNG="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
-# max_tokens is required by the real Anthropic leg this redirects to; without it
-# V1 comes back invalid_request_error and the echo assertion never gets to run.
+# max_tokens is a realistic Claude Code field and keeps the mock's echo tight.
 IMG_BODY='{"model":"claude-deepseek-v4-flash[1m]","stream":true,"max_tokens":32,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"'"$PNG"'"}},{"type":"text","text":"Reply with exactly: OK"}]}]}'
 
 cat >"$TMP/vision.yml" <<'EOF'
@@ -291,26 +327,27 @@ port: 8010
 sentinel: test-vision-sentinel
 vision:
   redirect: true
+  baseUrl: http://localhost:__MOCK__
 EOF
-if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8010 --port 8010 --config "$TMP/vision.yml"; then
+sed "s/__MOCK__/$MOCK_PORT/" "$TMP/vision.yml" > "$TMP/vision-mock.yml"
+if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8010 --port 8010 --config "$TMP/vision-mock.yml"; then
   V1="$(curl -s --max-time 30 -X POST http://localhost:8010/v1/messages -H "content-type: application/json" -H "authorization: Bearer test-vision-sentinel" -H "anthropic-version: 2023-06-01" -d "$IMG_BODY")"
-  # The gate itself is deterministic and free: whatever Anthropic answers, the
-  # mock must never have seen this request.
-  check "V1 image on deepseek redirects (mock never served it)" '! echo "$V1" | grep -q "ROUTED:"'
-  # The echo assertion needs a real 200. An account rate limit or an expired
-  # OAuth token is not a redirect bug, and asserting through one would report it
-  # as one — the rewrite itself is covered by test-parsing.sh's
-  # restoreClientModel cases, so skip loudly rather than fail misleadingly.
-  if echo "$V1" | grep -q '"type":"error"'; then
-    echo "SKIP  V1b display-id echo (Anthropic leg returned an error: $(echo "$V1" | sed -n 's/.*"type":"\([a-z_]*_error\)".*/\1/p' | head -1))"
-  else
-    check "V1b redirected response echoes the display id" 'echo "$V1" | grep -q "\"model\":\"claude-deepseek-v4-flash\[1m\]\""'
-    check "V1c redirected turn logged with a redirected field" 'grep -q "\"redirected\"" "$ROOT/logs/proxy-usage.jsonl"'
-  fi
+  # The gate itself is deterministic and free: the image request must not reach
+  # the DeepSeek mock route (which answers ROUTED:), and must reach the local
+  # vision leg's OpenAI route instead (which answers LOCAL_VISION:).
+  check "V1 image on deepseek redirects (never hits deepseek route)" '! echo "$V1" | grep -q "ROUTED:"'
+  check "V1a image request reaches the local vision leg" 'echo "$V1" | grep -q "LOCAL_VISION:"'
+  # The mock echoes the model the proxy sent on the OpenAI leg — proof the
+  # translation swapped to the configured local model, not the client's id.
+  check "V1b local leg receives the configured vision model" 'echo "$V1" | grep -q "LOCAL_VISION:prism-ml/bonsai-27b"'
+  # The Anthropic-shaped response the client sees must still echo the display id
+  # the normal DeepSeek path would have used (ADR-0001 restore contract).
+  check "V1c redirected response echoes the display id" 'echo "$V1" | grep -q "\"model\":\"claude-deepseek-v4-flash\[1m\]\""'
+  check "V1d redirected turn logged with a redirected field" 'grep -q "\"redirected\"" "$ROOT/logs/proxy-usage.jsonl"'
 
   # negative control: same proxy, no image, still routes to the mock
   N="$(curl -s --max-time 5 -X POST http://localhost:8010/v1/messages -H "content-type: application/json" -d '{"model":"claude-deepseek-v4-flash[1m]","messages":[{"role":"user","content":"x"}]}')"
-  check "V1d no-image request still routes to deepseek" 'echo "$N" | grep -q "ROUTED:deepseek-v4-flash"'
+  check "V1e no-image request still routes to deepseek" 'echo "$N" | grep -q "ROUTED:deepseek-v4-flash"'
 else
   echo "FAIL V1 could not start proxy with vision config"
 fi
@@ -337,12 +374,18 @@ redir:
   sonnet: deepseek-v4-flash
 vision:
   redirect: true
+  baseUrl: http://localhost:__MOCK__
 EOF
 IMG_SONNET='{"model":"claude-sonnet-4-5","stream":true,"max_tokens":32,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"'"$PNG"'"}},{"type":"text","text":"hi"}]}]}'
-if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8013 --port 8013 --config "$TMP/vision-redir.yml"; then
+sed "s/__MOCK__/$MOCK_PORT/" "$TMP/vision-redir.yml" > "$TMP/vision-redir-mock.yml"
+if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8013 --port 8013 --config "$TMP/vision-redir-mock.yml"; then
   V4="$(curl -s --max-time 30 -X POST http://localhost:8013/v1/messages -H "content-type: application/json" -H "anthropic-version: 2023-06-01" -d "$IMG_SONNET")"
-  check "V4 redir-routed image redirects too (mock never served it)" '! echo "$V4" | grep -q "ROUTED:"'
-  check "V4b redirect never answers with a deepseek display id for a redir turn" '! echo "$V4" | grep -q "claude-deepseek-"'
+  check "V4 redir-routed image redirects too (never hits deepseek route)" '! echo "$V4" | grep -q "ROUTED:"'
+  check "V4a redir-routed image reaches the local vision leg" 'echo "$V4" | grep -q "LOCAL_VISION:"'
+  # Echoing a DeepSeek display id here would flip the session model — the failure
+  # the redirect exists to avoid, pointed the other way. The client's own string
+  # (`claude-sonnet-4-5`) is what the normal redir path would have echoed.
+  check "V4b redirect echoes the client's own id, not a deepseek display id" 'echo "$V4" | grep -q "\"model\":\"claude-sonnet-4-5\"" && ! echo "$V4" | grep -q "claude-deepseek-"'
 
   NR="$(curl -s --max-time 5 -X POST http://localhost:8013/v1/messages -H "content-type: application/json" -d '{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"x"}]}')"
   check "V4c redir without an image still routes to deepseek" 'echo "$NR" | grep -q "ROUTED:deepseek-v4-flash"'

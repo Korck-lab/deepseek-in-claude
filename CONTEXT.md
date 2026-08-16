@@ -64,13 +64,14 @@ in `$PROXY_HOME/config.yml`; the launcher passes no flag. Crossings are tagged
 `fallbackFrom` in the usage log. See ADR-0005.
 
 **Vision redirect** — the reroute of a request carrying an image block away from a
-vision-less model (DeepSeek V4 has no vision) to a vision-capable Anthropic model
-(`claude-opus-5`, effort `low`, by default). Fires at route time when the resolved
-target's capability is `vision: false`; the redirected response echoes the client's
-display id so the session model survives. Distinct from *fallback* — the redirect leg
-forwards with `fb: null` on purpose. Capabilities are fetched from `/v1/models` when
-reported, defaulted per family otherwise, and overridable in the `capabilities:`
-config block. See ADR-0004.
+vision-less model (DeepSeek V4 has no vision) to a local vision model — LM Studio by
+default (`prism-ml/bonsai-27b` at `http://127.0.0.1:1234`), which speaks OpenAI
+protocol, so this leg translates Anthropic <-> OpenAI on both request and stream.
+Fires at route time when the resolved target's capability is `vision: false`; the
+redirected response echoes the client's display id so the session model survives.
+Distinct from *fallback* — the redirect leg forwards with `fb: null` on purpose.
+Capabilities are fetched from `/v1/models` when reported, defaulted per family
+otherwise, and overridable in the `capabilities:` config block. See ADR-0004.
 
 ## Shape of proxy.mjs
 
@@ -86,8 +87,9 @@ Sections in file order:
 | Usage log | one JSON line per DeepSeek request, always on |
 | DeepSeek routing | transparent forward to the Anthropic-compatible endpoint |
 | Merged model list | serves `GET /v1/models` — union of both legs |
-| Anthropic forward | body untouched (credential headers reworked by the bridge); head-buffers to rewrite `model` on a vision redirect |
-| Image routing helpers | `hasImageBlock` (recursive, anchored on `type`), `rewriteVision` |
+| Anthropic forward | body untouched (credential headers reworked by the bridge); streams straight through |
+| Local vision leg | `anthropicToOpenAI` (request) + `forwardToLocalVision` (OpenAI SSE → Anthropic SSE) |
+| Image routing helpers | `hasImageBlock` (recursive, anchored on `type`), `restoreClientModel` |
 | Server | request dispatch, including the pre-dispatch vision check |
 
 ## Deployment topology — read this before debugging

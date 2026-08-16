@@ -23,7 +23,7 @@ trap 'rm -rf "$WORK"' EXIT INT TERM
   echo 'const FAMILY_KEYS = Object.keys(REDIR_MAP);'
   sed -n '/^function familyOf/,/^}$/p' "$REPO/proxy.mjs"
   sed -n '/^function hasImageBlock/,/^}$/p' "$REPO/proxy.mjs"
-  sed -n '/^function rewriteVision/,/^}$/p' "$REPO/proxy.mjs"
+  sed -n '/^function anthropicToOpenAI/,/^}$/p' "$REPO/proxy.mjs"
   sed -n '/^function restoreClientModel/,/^}$/p' "$REPO/proxy.mjs"
   cat <<'CASES'
 
@@ -34,7 +34,7 @@ const eq = (label, got, want) => {
   console.log(`${ok ? "ok  " : "FAIL"} ${label}: got ${JSON.stringify(got)} want ${JSON.stringify(want)}`);
 };
 
-for (const fn of [loadYaml, normalizeModel, familyOf, hasImageBlock, rewriteVision, restoreClientModel]) {
+for (const fn of [loadYaml, normalizeModel, familyOf, hasImageBlock, anthropicToOpenAI, restoreClientModel]) {
   if (typeof fn !== "function") { console.error("extraction failed"); process.exit(2); }
 }
 
@@ -98,30 +98,67 @@ eq("image word in tool type", hasImageBlock(body({ model: "m", tools: [{ type: "
 eq("non-JSON body", hasImageBlock(Buffer.from("not json")), false);
 eq("empty body", hasImageBlock(Buffer.alloc(0)), false);
 
-console.log("-- rewriteVision: model + effort, rest untouched --");
-const src = { model: "claude-deepseek-v4-flash[1m]", max_tokens: 100, stream: true, output_config: { effort: "high" }, messages: [{ role: "user", content: "x" }] };
-const rw = rewriteVision(body(src), "claude-opus-5", "low", "claude-deepseek-v4-flash[1m]");
-const out = JSON.parse(rw.body.toString("utf8"));
-eq("model swapped", out.model, "claude-opus-5");
-eq("effort forced", out.output_config.effort, "low");
-eq("max_tokens untouched", out.max_tokens, 100);
-eq("stream untouched", out.stream, true);
-eq("messages untouched", JSON.stringify(out.messages), JSON.stringify(src.messages));
-eq("clientModel echoed", rw.clientModel, "claude-deepseek-v4-flash[1m]");
-eq("absent output_config gains effort", JSON.parse(rewriteVision(body({ model: "m" }), "v", "low", "m").body.toString("utf8")).output_config.effort, "low");
+console.log("-- anthropicToOpenAI: the local vision leg's request shape --");
+const base = { model: "claude-deepseek-v4-flash[1m]", max_tokens: 100, stream: true, messages: [{ role: "user", content: "x" }] };
+const oai = (obj) => anthropicToOpenAI(body(obj), "prism-ml/bonsai-27b");
+eq("model swapped to the local model", oai(base).model, "prism-ml/bonsai-27b");
+eq("stream survives", oai(base).stream, true);
+eq("max_tokens survives", oai(base).max_tokens, 100);
+eq("plain string content survives", JSON.stringify(oai(base).messages), JSON.stringify([{ role: "user", content: "x" }]));
 
-// The vision redirect answers on the Anthropic leg, whose upstream host is a bare
-// literal with no override (see scripts/test-auth-bridge.sh), so the echo is
-// asserted here on the same function that leg calls rather than through a server.
-console.log("-- restoreClientModel: the vision redirect echoes the display id --");
+// image block -> OpenAI image_url with a data URI (the point of this leg)
+const imgReq = oai({ model: "m", messages: [{ role: "user", content: [
+  { type: "image", source: { type: "base64", media_type: "image/png", data: "AAA" } },
+  { type: "text", text: "look" },
+] }] });
+eq("base64 image becomes image_url data uri", JSON.stringify(imgReq.messages[0].content), JSON.stringify([
+  { type: "image_url", image_url: { url: "data:image/png;base64,AAA" } },
+  { type: "text", text: "look" },
+]));
+
+// image with a URL source passes the URL through
+const urlReq = oai({ model: "m", messages: [{ role: "user", content: [{ type: "image", source: { type: "url", url: "https://x/y.png" } }] }] });
+eq("url image becomes image_url url", urlReq.messages[0].content[0].image_url.url, "https://x/y.png");
+
+// system (string or text-block array) becomes a leading system message
+eq("system string becomes system message", JSON.stringify(oai({ model: "m", system: "sys", messages: [{ role: "user", content: "x" }] }).messages[0]), JSON.stringify({ role: "system", content: "sys" }));
+eq("system text-block array joins", oai({ model: "m", system: [{ type: "text", text: "a" }, { type: "text", text: "b" }], messages: [] }).messages[0].content, "ab");
+
+// tool_result -> OpenAI tool message keyed by tool_use_id
+const tr = oai({ model: "m", messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "42" }] }] });
+eq("tool_result becomes a tool message", JSON.stringify(tr.messages[0]), JSON.stringify({ role: "tool", tool_call_id: "t1", content: "42" }));
+
+// tool_use -> OpenAI assistant tool_calls
+const tu = oai({ model: "m", messages: [{ role: "assistant", content: [{ type: "tool_use", id: "t2", name: "f", input: { a: 1 } }] }] });
+eq("tool_use becomes assistant tool_calls", JSON.stringify(tu.messages[0].tool_calls), JSON.stringify([{ id: "t2", type: "function", function: { name: "f", arguments: '{"a":1}' } }]));
+
+// tools: schema-shape change + advisor_* dropped (same rule as the DeepSeek leg)
+const tools = oai({ model: "m", messages: [], tools: [
+  { name: "web", description: "d", input_schema: { type: "object" } },
+  { type: "advisor_20260301", name: "advisor", description: "", input_schema: {} },
+] });
+eq("tools become OpenAI function tools", JSON.stringify(tools.tools), JSON.stringify([{ type: "function", function: { name: "web", description: "d", parameters: { type: "object" } } }]));
+
+// output_config.effort is dropped — OpenAI has no effort concept
+const effort = oai({ model: "m", output_config: { effort: "high" }, messages: [] });
+eq("output_config.effort dropped", "output_config" in effort, false);
+
+// stop_sequences survives as OpenAI `stop`
+eq("stop_sequences become stop", JSON.stringify(oai({ model: "m", stop_sequences: ["a"], messages: [] }).stop), JSON.stringify(["a"]));
+
+// The DeepSeek leg head-buffers to the first SSE event and rewrites `model`
+// back to the display id the client asked for, so a resumed session keeps its
+// display model (ADR-0001). That rewrite is a pure function with no server
+// dependency, so the echo is asserted here on the slice rather than through one.
+console.log("-- restoreClientModel: the DeepSeek leg echoes the display id --");
 const startEvent = (m) => `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","model":"${m}","role":"assistant"}}\n\n`;
 eq(
-  "opus-5 rewritten to the deepseek display id",
+  "real model rewritten to the display id",
   restoreClientModel(startEvent("claude-opus-5"), "claude-deepseek-v4-flash[1m]", "claude-opus-5"),
   startEvent("claude-deepseek-v4-flash[1m]")
 );
 eq(
-  "prose naming the vision model is untouched",
+  "prose naming the real model is untouched",
   restoreClientModel('data: {"text":"I used claude-opus-5 for this"}', "claude-deepseek-v4-flash[1m]", "claude-opus-5"),
   'data: {"text":"I used claude-opus-5 for this"}'
 );
