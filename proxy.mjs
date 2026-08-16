@@ -1443,9 +1443,17 @@ function forwardToLocalVision(req, res, reqPath, body, clientModel) {
       });
       up.on("end", () => {
         // A response that ended before emitting finish_reason — short, truncated,
-        // or non-SSE — still has to reach the client as a complete message.
+        // or non-SSE — still has to reach the client as a complete message. A
+        // non-streaming upstream answers a plain chat.completion JSON body:
+        // extract its content instead of leaking the raw envelope as the answer.
         if (!wroteDelta && buf.trim()) {
-          res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: buf.trim() } })}\n\n`);
+          let text = buf.trim();
+          try {
+            const o = JSON.parse(text);
+            const content = o?.choices?.[0]?.message?.content;
+            if (typeof content === "string") text = content;
+          } catch { /* not JSON — keep the raw text */ }
+          res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })}\n\n`);
         }
         finish();
       });

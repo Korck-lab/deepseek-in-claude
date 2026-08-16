@@ -100,7 +100,15 @@ http.createServer((req, res) => {
     // the client receives. Echo the model the proxy sent (proof the rewrite
     // reached the leg) — a mock that never sees it also never reports it.
     if (req.url.includes("/v1/chat/completions")) {
-      const seenModel = JSON.parse(Buffer.concat(chunks).toString("utf8")).model ?? "?";
+      const j = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      const seenModel = j.model ?? "?";
+      // Non-streaming upstream (V5): a stream:false request answers a plain
+      // chat.completion JSON body, which the proxy must translate — not leak.
+      if (j.stream === false) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ id: "chatcmpl-ns", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: `NONSTREAM:${seenModel}` }, finish_reason: "stop" }] }));
+        return;
+      }
       const oai = (d) => `data: ${JSON.stringify({ id: "chatcmpl-mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: d, finish_reason: null }] })}\n\n`;
       res.writeHead(200, { "content-type": "text/event-stream" });
       res.end(
@@ -391,6 +399,30 @@ if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8013 --
   check "V4c redir without an image still routes to deepseek" 'echo "$NR" | grep -q "ROUTED:deepseek-v4-flash"'
 else
   echo "FAIL V4 could not start proxy with redir+vision config"
+fi
+
+# V5 non-streaming upstream: a stream:false image turn makes the local leg
+# receive a plain chat.completion JSON body (not SSE). It must be translated to
+# the Anthropic answer text — not leaked as the raw JSON, which is what the old
+# "buffer leftover" fallback did for any non-SSE body.
+cat >"$TMP/vision-ns.yml" <<'EOF'
+port: 8014
+vision:
+  redirect: true
+  baseUrl: http://localhost:__MOCK__
+EOF
+IMG_NS='{"model":"claude-deepseek-v4-flash[1m]","stream":false,"max_tokens":64,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"'"$PNG"'"}},{"type":"text","text":"hi"}]}]}'
+sed "s/__MOCK__/$MOCK_PORT/" "$TMP/vision-ns.yml" > "$TMP/vision-ns-mock.yml"
+if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8014 --port 8014 --config "$TMP/vision-ns-mock.yml"; then
+  V5="$(curl -s --max-time 30 -X POST http://localhost:8014/v1/messages -H "content-type: application/json" -d "$IMG_NS")"
+  check "V5 non-streaming local leg answers the translated text" 'echo "$V5" | grep -q "NONSTREAM:prism-ml/bonsai-27b"'
+  # The envelope id marks the raw JSON: the bug leaked the whole body as the
+  # answer text (quotes JSON-escaped inside the delta), so only the content
+  # survives translation. chatcmpl-ns appears in the leaked body, never in the
+  # extracted text.
+  check "V5b non-streaming answer is not the raw JSON envelope" '! echo "$V5" | grep -q "chatcmpl-ns"'
+else
+  echo "FAIL V5 could not start proxy with vision-ns config"
 fi
 
 cat >"$TMP/vision-cap.yml" <<'EOF'
