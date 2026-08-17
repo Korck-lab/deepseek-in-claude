@@ -67,7 +67,11 @@ in `$PROXY_HOME/config.yml`; the launcher passes no flag. Crossings are tagged
 vision-less model (DeepSeek V4 has no vision) to a local vision model — LM Studio by
 default (`prism-ml/bonsai-27b` at `http://127.0.0.1:1234`), which speaks OpenAI
 protocol, so this leg translates Anthropic <-> OpenAI on both request and stream.
-Fires at route time when the resolved target's capability is `vision: false`; the
+Fires at route time when the resolved target's capability is `vision: false`, and
+**off unless asked for** — it ships the prompt and image to a host the proxy would
+otherwise never contact, and answers out of a model the user did not pick. Opt in
+with `vision.redirect: true` in `$PROXY_HOME/config.yml`; left off, the image turn
+400s upstream and the disabled path warns which setting would have handled it. The
 redirected response echoes the client's display id so the session model survives.
 Distinct from *fallback* — the redirect leg forwards with `fb: null` on purpose.
 Capabilities are fetched from `/v1/models` when reported, defaulted per family

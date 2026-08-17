@@ -1,7 +1,8 @@
 # ADR-0004 — Image-bearing requests redirect from vision-less models to a local vision model
 
 Date: 2026-08-12
-Status: Accepted (amended 2026-08-16 — the redirect target is a local model, not an Anthropic one)
+Status: Accepted (amended 2026-08-16 — the redirect target is a local model, not an
+Anthropic one; and, later the same day, the redirect is opt-in rather than on by default)
 
 ## Context
 
@@ -70,9 +71,17 @@ vision model and forwards it to that model's OpenAI-compatible endpoint.
    resumed session keeps the model the user picked and the next image turn
    re-redirects. This is ADR-0001's display-id contract applied here; the same
    contract the original Anthropic redirect enforced via `restoreClientModel`.
-7. **Redirect is on by default.** A hard 400 with no degradation is worse than
-   routing an occasional image turn to a local model. It costs nothing but local
-   inference when an image actually appears. No credential bridge is involved —
+7. **Redirect is opt-in — `vision.redirect: true`, off otherwise.** It was on by
+   default when the target was an Anthropic model the user was already paying for
+   and already talking to; a hard 400 was the worse answer. Naming a *local* target
+   changed what the default asserts. The redirect now ships the prompt and the image
+   to a host the proxy would otherwise never contact, one the user has to be running
+   for it to work at all, and answers out of a model they did not pick in `/model`.
+   Defaulting that on decides for a user who never configured the leg, and the same
+   global `config.yml` decides it for every project at once — the shape ADR-0005
+   rejected for fallback. Off, the turn 400s as it did before the feature existed,
+   and the disabled path warns which setting would have handled it, so the failure
+   is actionable rather than opaque. No credential bridge is involved either way —
    the leg needs no auth, so the old startup warning about the bridge is gone.
 8. **Redirected legs that answer are logged.** The usage log gains a `redirected:
    {to, reason: "vision"}` field; without it those turns are invisible. A redirect
@@ -81,10 +90,12 @@ vision model and forwards it to that model's OpenAI-compatible endpoint.
 
 ## Consequences
 
-- **Image turns no longer 400, and no longer cost Anthropic plan traffic.** A
-  pasted screenshot, an image in context, or a tool-returned image routes to a
-  local model that can actually see it, and the session model is unchanged for
-  the turns that follow. This works on a week with zero Anthropic credits.
+- **Once turned on, image turns no longer 400, and never cost Anthropic plan
+  traffic.** A pasted screenshot, an image in context, or a tool-returned image
+  routes to a local model that can actually see it, and the session model is
+  unchanged for the turns that follow. This works on a week with zero Anthropic
+  credits. Until turned on, image turns fail exactly as they did before the
+  feature existed — with a warning naming the setting.
 - **The routing rule is capability-driven, not family-hardcoded.** Adding a
   vision-capable DeepSeek-class model later is a one-line `capabilities:` override
   or, if upstream starts reporting the field, nothing at all.
@@ -105,7 +116,11 @@ vision model and forwards it to that model's OpenAI-compatible endpoint.
 
 Guarded by `scripts/test-parsing.sh` (pure `hasImageBlock` / `anthropicToOpenAI`
 slices) and `scripts/test.sh` mock-upstream cases (redirect on/off, capability
-override, negative control, local-model echo).
+override, negative control, local-model echo). The opt-in default has exactly one
+guard, `V6`: every other case sets `redirect: true` explicitly and so passes under
+either default. `V6` runs a config with no `vision` block at all and asserts the
+image stays on DeepSeek and the warning names the setting. `V2` covers explicit
+`false`, a different path through `CFG.vision?.redirect`; neither replaces the other.
 
 ## Alternatives rejected
 

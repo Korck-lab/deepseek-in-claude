@@ -50,7 +50,9 @@ start_proxy() { # start_proxy WAIT_PORT [node args...]
       return 1
       ;;
   esac
-  node "$ROOT/proxy.mjs" "$@" >/dev/null 2>&1 &
+  # Set PROXY_ERR to keep this proxy's stderr for a case that asserts on a
+  # warning; unset, it is discarded as before.
+  node "$ROOT/proxy.mjs" "$@" >/dev/null 2>"${PROXY_ERR:-/dev/null}" &
   PIDS+=("$!")
   # Counted loop rather than `seq`, which is not POSIX and is absent on some
   # systems — its failure here would collapse the wait to zero attempts and
@@ -371,6 +373,26 @@ if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8011 --
 else
   echo "FAIL V2 could not start proxy with vision-off config"
 fi
+
+# V6 — the opt-in contract (ADR-0004 decision 7). Every other V case names
+# `redirect: true`, so they pass on either default; only a config with no vision
+# block at all distinguishes opt-in from opt-out. Absent is a different path
+# through `CFG.vision?.redirect` than V2's explicit false, so both stay.
+cat >"$TMP/vision-absent.yml" <<'EOF'
+port: 8018
+EOF
+PROXY_ERR="$TMP/vision-absent.err"
+if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8018 --port 8018 --config "$TMP/vision-absent.yml"; then
+  V6="$(curl -s --max-time 5 -X POST http://localhost:8018/v1/messages -H "content-type: application/json" -d "$IMG_BODY")"
+  check "V6 no vision block leaves image on deepseek (redirect is opt-in)" 'echo "$V6" | grep -q "ROUTED:deepseek-v4-flash"'
+  check "V6a no vision block never reaches the local vision leg" '! echo "$V6" | grep -q "LOCAL_VISION:"'
+  # The turn that stays put dies upstream; the warning is what makes that
+  # failure actionable instead of reading like a CLI problem.
+  check "V6b disabled redirect warns and names the setting" 'grep -q "vision.redirect: true" "$TMP/vision-absent.err"'
+else
+  echo "FAIL V6 could not start proxy with vision-absent config"
+fi
+unset PROXY_ERR
 
 # A redir-routed family name is DeepSeek-bound too, so the image check fires — but
 # the response must still echo `sonnet`, the id the client sent. Echoing a DeepSeek

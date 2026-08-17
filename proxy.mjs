@@ -425,11 +425,14 @@ let refreshInFlight = null;
 // request is rerouted to a local vision model instead (see the Vision capability
 // map section) — LM Studio by default, which speaks OpenAI protocol, so this leg
 // translates Anthropic <-> OpenAI rather than reusing the Anthropic upstream.
-// On by default — the alternative is a hard 400. No plan traffic: this leg never
-// touches api.anthropic.com, so an image turn costs nothing but local inference.
+// Off unless asked for: the redirect sends the turn — image included — to an
+// endpoint the user has to be running, and nobody has one by default. Firing on
+// capability alone would ship prompt content to a host nobody named, and answer
+// out of a model nobody chose. Left off, an image turn 400s upstream, and the
+// disabled path says so. Opt in with `vision.redirect: true`.
 // ---------------------------------------------------------------------------
 
-const VISION_REDIRECT = CFG.vision?.redirect !== false;
+const VISION_REDIRECT = CFG.vision?.redirect === true;
 const VISION_MODEL = CFG.vision?.model ?? "prism-ml/bonsai-27b";
 const VISION_BASE_URL = CFG.vision?.baseUrl ?? "http://127.0.0.1:1234";
 
@@ -1516,7 +1519,14 @@ function handle(req, res) {
       // later failure cannot re-send the image to the vision-less model.
       const dsReal = model ? deepseekRealId(model) : null;
       const dsTarget = dsReal ?? (fam && redirOn ? REDIR_MAP[fam] : null);
-      if (VISION_REDIRECT && !isTokenCount(reqPath) && dsTarget && capabilityOf(dsTarget) === false && hasImageBlock(body)) {
+      const needsVision = !isTokenCount(reqPath) && dsTarget && capabilityOf(dsTarget) === false && hasImageBlock(body);
+      if (needsVision && !VISION_REDIRECT) {
+        // The turn is about to 400 upstream on a body the model cannot read.
+        // That failure reads like a CLI or model-support problem, so name the
+        // one setting that changes it rather than letting the 400 speak.
+        warnOnce(`image sent to ${dsTarget}, which has no vision — this turn will fail upstream. Set \`vision.redirect: true\` in config.yml to route image turns to a local vision model.`, "vision");
+      }
+      if (needsVision && VISION_REDIRECT) {
         // Echo exactly what the normal DeepSeek path would have echoed: the
         // canonical display id for a DeepSeek model, and the client's own string
         // for a family name being redir-routed. Answering a `--redir --model

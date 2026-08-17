@@ -48,14 +48,23 @@ effort:
   xhigh: max    # other-family "xhigh"  -> DeepSeek "max"
 
 # Route image-bearing requests away from vision-less models.
-# DeepSeek V4 has no vision, so an image block in a request 400s upstream. When
-# the target model lacks vision capability, the request is rerouted to a local
-# vision model — LM Studio by default, which speaks OpenAI protocol, so this leg
-# translates Anthropic <-> OpenAI. No Anthropic plan traffic: an image turn costs
-# only local inference. baseUrl is the LM Studio server; model is the id it
-# reports on /v1/models. Off leaves image turns to fail upstream. See ADR-0004.
+# DeepSeek V4 has no vision, so an image block in a request 400s upstream. Turned
+# on, a turn carrying an image goes to a local vision model instead — LM Studio
+# by default, which speaks OpenAI protocol, so this leg translates
+# Anthropic <-> OpenAI. No Anthropic plan traffic: an image turn costs only local
+# inference.
+#
+# Off by default, because the redirect only works if you are running that server,
+# and turning it on sends your prompt and image to it — a host the proxy would
+# otherwise never contact — and answers you out of a model you did not pick in
+# `/model`. One proxy serves every project, so this applies to all of them at
+# once. Left off, an image turn fails upstream and the proxy says why.
+#
+# baseUrl is the OpenAI-compatible server; model is the vision-capable id it
+# reports on /v1/models. Redirected turns are tagged `redirected` in
+# logs/proxy-usage.jsonl. See docs/adr/0004.
 vision:
-  redirect: true
+  redirect: false
   baseUrl: http://127.0.0.1:1234
   model: prism-ml/bonsai-27b
 
