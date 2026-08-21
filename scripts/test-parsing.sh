@@ -25,6 +25,8 @@ trap 'rm -rf "$WORK"' EXIT INT TERM
   sed -n '/^function hasImageBlock/,/^}$/p' "$REPO/proxy.mjs"
   sed -n '/^function anthropicToOpenAI/,/^}$/p' "$REPO/proxy.mjs"
   sed -n '/^function restoreClientModel/,/^}$/p' "$REPO/proxy.mjs"
+  sed -n '/^function rewriteVision/,/^}$/p' "$REPO/proxy.mjs"
+  sed -n '/^function restoreRedirectedModel/,/^}$/p' "$REPO/proxy.mjs"
   cat <<'CASES'
 
 let fails = 0;
@@ -34,7 +36,7 @@ const eq = (label, got, want) => {
   console.log(`${ok ? "ok  " : "FAIL"} ${label}: got ${JSON.stringify(got)} want ${JSON.stringify(want)}`);
 };
 
-for (const fn of [loadYaml, normalizeModel, familyOf, hasImageBlock, anthropicToOpenAI, restoreClientModel]) {
+for (const fn of [loadYaml, normalizeModel, familyOf, hasImageBlock, anthropicToOpenAI, restoreClientModel, rewriteVision, restoreRedirectedModel]) {
   if (typeof fn !== "function") { console.error("extraction failed"); process.exit(2); }
 }
 
@@ -163,6 +165,49 @@ eq(
   'data: {"text":"I used claude-opus-5 for this"}'
 );
 eq("identical ids are a no-op", restoreClientModel(startEvent("claude-opus-5"), "claude-opus-5", "claude-opus-5"), startEvent("claude-opus-5"));
+
+console.log("-- restoreRedirectedModel: the id upstream echoes is not the id we sent --");
+eq(
+  "a dated snapshot id is still rewritten",
+  restoreRedirectedModel(startEvent("claude-haiku-4-5-20251001"), "claude-deepseek-v4-flash[1m]"),
+  startEvent("claude-deepseek-v4-flash[1m]")
+);
+eq(
+  "an exact-match id is rewritten too",
+  restoreRedirectedModel(startEvent("claude-sonnet-5"), "claude-deepseek-v4-flash[1m]"),
+  startEvent("claude-deepseek-v4-flash[1m]")
+);
+eq(
+  "only the first model field is touched",
+  restoreRedirectedModel(startEvent("claude-sonnet-5") + startEvent("claude-sonnet-5"), "x"),
+  startEvent("x") + startEvent("claude-sonnet-5")
+);
+eq("no client model is a no-op", restoreRedirectedModel(startEvent("claude-sonnet-5"), null), startEvent("claude-sonnet-5"));
+
+console.log("-- rewriteVision: the Anthropic vision tier's request shape --");
+const visionIn = (extra = {}) => Buffer.from(JSON.stringify({
+  model: "deepseek-v4-flash",
+  max_tokens: 4096,
+  stream: true,
+  system: "be brief",
+  messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "AAA" } }] }],
+  ...extra,
+}));
+const visionOut = (extra = {}) => JSON.parse(rewriteVision(visionIn(extra), "claude-sonnet-5", "medium").toString("utf8"));
+eq("model swapped to the vision model", visionOut().model, "claude-sonnet-5");
+eq("effort set inside output_config", visionOut().output_config, { effort: "medium" });
+eq("the image block survives untouched", visionOut().messages[0].content[0].source.data, "AAA");
+eq("unrelated fields survive", [visionOut().max_tokens, visionOut().stream, visionOut().system], [4096, true, "be brief"]);
+eq(
+  "an existing output_config is merged, not replaced",
+  visionOut({ output_config: { format: { type: "json" }, effort: "max" } }).output_config,
+  { format: { type: "json" }, effort: "medium" }
+);
+eq(
+  "no effort configured leaves output_config alone",
+  JSON.parse(rewriteVision(visionIn(), "claude-sonnet-5", null).toString("utf8")).output_config,
+  undefined
+);
 
 console.log(fails ? `\n${fails} failing` : "\nall passing");
 process.exit(fails ? 1 : 0);

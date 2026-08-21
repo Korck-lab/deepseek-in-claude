@@ -422,19 +422,52 @@ let refreshInFlight = null;
 //
 // DeepSeek V4 models have no vision; a request carrying an image block 400s
 // upstream. When the resolved target model lacks vision capability, such a
-// request is rerouted to a local vision model instead (see the Vision capability
-// map section) — LM Studio by default, which speaks OpenAI protocol, so this leg
-// translates Anthropic <-> OpenAI rather than reusing the Anthropic upstream.
-// Off unless asked for: the redirect sends the turn — image included — to an
-// endpoint the user has to be running, and nobody has one by default. Firing on
-// capability alone would ship prompt content to a host nobody named, and answer
-// out of a model nobody chose. Left off, an image turn 400s upstream, and the
-// disabled path says so. Opt in with `vision.redirect: true`.
+// request is rerouted to a model that can see it. Two tiers, tried in order:
+//
+//   1. A local vision model — LM Studio by default, which speaks OpenAI
+//      protocol, so that leg translates Anthropic <-> OpenAI rather than reusing
+//      the Anthropic upstream. Off unless asked for: it sends the turn — image
+//      included — to an endpoint the user has to be running, and nobody has one
+//      by default. Firing on capability alone would ship prompt content to a
+//      host nobody named. Opt in with `vision.redirect: true`.
+//   2. The Anthropic leg the proxy is already talking to, on the plan credential
+//      the credential bridge already holds. On by default: unlike the local leg
+//      it names no new host, needs nothing running, and spends the plan the user
+//      is already on — and the alternative is a hard 400 on every image turn.
+//      It does cost plan traffic per image, so `vision.anthropic: false` turns
+//      it off and restores the 400-with-a-warning.
+//
+// With both off, an image turn 400s upstream and the disabled path says which
+// setting would have handled it.
 // ---------------------------------------------------------------------------
 
 const VISION_REDIRECT = CFG.vision?.redirect === true;
 const VISION_MODEL = CFG.vision?.model ?? "prism-ml/bonsai-27b";
 const VISION_BASE_URL = CFG.vision?.baseUrl ?? "http://127.0.0.1:1234";
+
+// Boolean-or-object, the shape `redir` already uses: `anthropic: false` disables
+// the tier, an object configures it, absent takes the defaults.
+const VISION_ANTHROPIC_CFG = CFG.vision?.anthropic;
+const VISION_ANTHROPIC = VISION_ANTHROPIC_CFG !== false;
+const VISION_ANTHROPIC_OPTS =
+  VISION_ANTHROPIC_CFG && typeof VISION_ANTHROPIC_CFG === "object" ? VISION_ANTHROPIC_CFG : {};
+// Sonnet 5 at medium effort: vision-capable, cheapest of the current tier that
+// is, and medium is enough to read a screenshot without paying max-effort
+// thinking for it. Both are `vision.anthropic.{model,effort}` overridable — a
+// user who wants opus on an image turn says so.
+const VISION_ANTHROPIC_MODEL = VISION_ANTHROPIC_OPTS.model ?? "claude-sonnet-5";
+const VISION_ANTHROPIC_EFFORT = VISION_ANTHROPIC_OPTS.effort ?? "medium";
+
+// The Anthropic tier answers 401 without the bridge: in sentinel mode the leg
+// carries the proxy's own sentinel, not a credential api.anthropic.com accepts.
+// Silent otherwise until the first image turn fails, far from the setting that
+// caused it.
+if (VISION_ANTHROPIC && !AUTH_BRIDGE) {
+  warnOnce(
+    `vision falls back to ${VISION_ANTHROPIC_MODEL} on the Anthropic leg, but the credential bridge is off — image turns will answer 401. Set \`vision.anthropic: false\` to leave them on DeepSeek instead.`,
+    "vision"
+  );
+}
 
 function warnOnce(message, scope = "auth-bridge") {
   if (credWarned.has(message)) return;
@@ -954,7 +987,12 @@ function handleDeepSeek(req, res, body, reqPath, redir, opts = {}) {
           return;
         }
         if (status === 200) {
-          res.writeHead(status, cleanResponseHeaders(up.headers));
+          const outHeaders = cleanResponseHeaders(up.headers);
+          // Same reason as the Anthropic leg: rewriting the model id changes the
+          // byte length, and a declared content-length would truncate a
+          // non-streaming answer.
+          if (sentModel !== clientModel) delete outHeaders["content-length"];
+          res.writeHead(status, outHeaders);
           const respChunks = [];
           // `model` lives in the first SSE event (message_start), so hold bytes
           // only until that event is complete, rewrite it, and stream the rest
@@ -1144,6 +1182,24 @@ function restoreClientModel(text, clientModel, realModel) {
   );
 }
 
+/** The same contract as `restoreClientModel`, for a leg where the id upstream
+ * echoes is not the id we sent. Anthropic resolves an alias to a dated snapshot
+ * — a request for `claude-haiku-4-5` answers `claude-haiku-4-5-20251001` — so an
+ * equality-anchored rewrite finds nothing, silently no-ops, and the client
+ * restores its session to a model the user never picked. That is the exact
+ * failure ADR-0001 exists to prevent, and it fails quietly: the turn answers
+ * fine and the damage shows up one reconnect later.
+ *
+ * So this rewrites the first `"model"` field it finds rather than a named one.
+ * Safe because the caller only ever hands it the buffered head — the
+ * `message_start` event, or a short non-SSE body — whose first model field is
+ * the message's own. Prose in later events is never in scope; it has already
+ * been streamed through untouched. */
+function restoreRedirectedModel(text, clientModel) {
+  if (!clientModel) return text;
+  return text.replace(/("model"\s*:\s*)"[^"]*"/, `$1${JSON.stringify(clientModel)}`);
+}
+
 /** The `model` a forwarded body actually carries, for the usage log. */
 function sentModelOf(body) {
   try {
@@ -1181,7 +1237,50 @@ async function forwardToAnthropic(req, res, reqPath, body, fb, opts = {}) {
         handleDeepSeek(req, res, rewriteModel(body, fb.mapped), reqPath, null, { fallbackFrom: "anthropic" });
         return;
       }
-      res.writeHead(status, cleanResponseHeaders(up.headers));
+      const rewriting = status === 200 && Boolean(opts.restoreModel);
+      const outHeaders = cleanResponseHeaders(up.headers);
+      // The rewrite changes the body's byte length. A declared content-length
+      // from upstream would then truncate a non-streaming answer mid-JSON, so
+      // drop it and let Node frame the response itself.
+      if (rewriting) delete outHeaders["content-length"];
+      res.writeHead(status, outHeaders);
+      if (rewriting) {
+        // Answer in the client's vocabulary: `message_start` reports the model
+        // actually sent upstream, and a resumed session restores its model from
+        // that field — so a redirected turn must echo the client's display id,
+        // not the vision model. Hold bytes only until the first SSE event is
+        // complete, rewrite the `model` field, stream the rest. Mirror of the
+        // head-buffering in handleDeepSeek; only the redirect leg needs it, a
+        // plain Anthropic passthrough streams straight through.
+        const respChunks = [];
+        let head = Buffer.alloc(0);
+        up.on("data", (c) => {
+          respChunks.push(c);
+          if (head === null) { res.write(c); return; }
+          head = Buffer.concat([head, c]);
+          const text = head.toString("utf8");
+          const end = text.indexOf("\n\n");
+          if (end === -1 && head.length < 65536) return;
+          res.write(Buffer.from(restoreRedirectedModel(text, opts.restoreModel), "utf8"));
+          head = null;
+        });
+        up.on("end", () => {
+          // A response that ended before its first event boundary — short,
+          // non-SSE, or truncated — still has to reach the client.
+          if (head !== null && head.length > 0) {
+            res.write(Buffer.from(restoreRedirectedModel(head.toString("utf8"), opts.restoreModel), "utf8"));
+          }
+          head = null;
+          clearUpstreamTimeout();
+          res.end();
+          // Redirected turns bill Anthropic plan traffic; make them visible in
+          // the usage log or they read as missing.
+          if (opts.redirected) {
+            logUsage({ method: req.method, path: reqPath, status, ms: Date.now() - started, model: opts.realModel, usage: decodeSse(Buffer.concat(respChunks).toString("utf8")), redirected: opts.redirected });
+          }
+        });
+        return;
+      }
       // A plain Anthropic turn is the user's own plan traffic and stays out of
       // the usage log — that log is the DeepSeek spend ledger. A turn that got
       // here because the DeepSeek leg gave up is the exception: it is the
@@ -1219,8 +1318,8 @@ async function forwardToAnthropic(req, res, reqPath, body, fb, opts = {}) {
     // A crossing that then failed is still a crossing, and the ledger is where
     // the user goes to find out what happened to a turn. Without this row the
     // record shows only the crossings that worked.
-    if (opts.fallbackFrom) {
-      logUsage({ method: req.method, path: reqPath, status: 502, ms: Date.now() - started, model: sentModelOf(body), usage: null, fallbackFrom: opts.fallbackFrom, error: err.message });
+    if (opts.fallbackFrom || opts.redirected) {
+      logUsage({ method: req.method, path: reqPath, status: 502, ms: Date.now() - started, model: sentModelOf(body), usage: null, ...(opts.fallbackFrom ? { fallbackFrom: opts.fallbackFrom } : {}), ...(opts.redirected ? { redirected: opts.redirected } : {}), error: err.message });
     }
     sendError(res, 502, "api_error", `agent-proxy upstream error: ${err.message}`);
   });
@@ -1251,6 +1350,22 @@ function hasImageBlock(bodyBuf) {
     return false;
   };
   return walk(root);
+}
+
+/** Rewrite an image-bearing request for the Anthropic vision tier: swap the
+ * model, set the configured effort, keep every other field as the client sent
+ * it. Both legs already speak Anthropic, so this is a two-field edit rather than
+ * the protocol translation the local leg needs.
+ *
+ * `effort` rides in `output_config`, merged rather than replaced — a client that
+ * set other output_config keys keeps them. Sonnet 5 accepts the same five levels
+ * Claude Code uses, so no level needs bridging. The response still has to echo
+ * the client's own id, which is `restoreClientModel`'s job at the other end. */
+function rewriteVision(bodyBuf, model, effort) {
+  const j = JSON.parse(bodyBuf.toString("utf8"));
+  j.model = model;
+  if (effort) j.output_config = { ...(j.output_config ?? {}), effort };
+  return Buffer.from(JSON.stringify(j));
 }
 
 /** Translate an Anthropic-format request body into OpenAI chat.completions
@@ -1520,22 +1635,43 @@ function handle(req, res) {
       const dsReal = model ? deepseekRealId(model) : null;
       const dsTarget = dsReal ?? (fam && redirOn ? REDIR_MAP[fam] : null);
       const needsVision = !isTokenCount(reqPath) && dsTarget && capabilityOf(dsTarget) === false && hasImageBlock(body);
-      if (needsVision && !VISION_REDIRECT) {
-        // The turn is about to 400 upstream on a body the model cannot read.
-        // That failure reads like a CLI or model-support problem, so name the
-        // one setting that changes it rather than letting the 400 speak.
-        warnOnce(`image sent to ${dsTarget}, which has no vision — this turn will fail upstream. Set \`vision.redirect: true\` in config.yml to route image turns to a local vision model.`, "vision");
-      }
-      if (needsVision && VISION_REDIRECT) {
+      if (needsVision) {
         // Echo exactly what the normal DeepSeek path would have echoed: the
         // canonical display id for a DeepSeek model, and the client's own string
         // for a family name being redir-routed. Answering a `--redir --model
         // sonnet` turn with a DeepSeek display id would flip the session model
         // on the user — the same failure ADR-0004 redirects to avoid, pointed
-        // the other way.
+        // the other way. Both tiers echo the same id, for the same reason.
         const echo = dsReal ? displayIdOf(dsReal) : model;
-        forwardToLocalVision(req, res, reqPath, body, echo);
-        return;
+        // Local first: it is opt-in, so a user who configured it asked for it by
+        // name, and it costs no plan traffic. The Anthropic tier is the default
+        // catch, not the preference.
+        if (VISION_REDIRECT) {
+          forwardToLocalVision(req, res, reqPath, body, echo);
+          return;
+        }
+        if (VISION_ANTHROPIC) {
+          // `fb` is null on purpose, exactly as on the local leg: error-falling
+          // back would re-send the image to the vision-less model and fail
+          // again. The redirect is the fix, not a stage in the fallback chain.
+          let visionBody;
+          try {
+            visionBody = rewriteVision(body, VISION_ANTHROPIC_MODEL, VISION_ANTHROPIC_EFFORT);
+          } catch (err) {
+            sendError(res, 400, "api_error", `vision request could not be rewritten: ${err.message}`);
+            return;
+          }
+          void forwardToAnthropic(req, res, reqPath, visionBody, null, {
+            restoreModel: echo,
+            realModel: VISION_ANTHROPIC_MODEL,
+            redirected: { to: VISION_ANTHROPIC_MODEL, reason: "vision" },
+          }).catch((err) => sendError(res, 502, "api_error", err.message));
+          return;
+        }
+        // Both tiers off: the turn is about to 400 upstream on a body the model
+        // cannot read. That failure reads like a CLI or model-support problem,
+        // so name the settings that change it rather than letting the 400 speak.
+        warnOnce(`image sent to ${dsTarget}, which has no vision — this turn will fail upstream. Set \`vision.anthropic\` back on to answer it on the Anthropic leg, or \`vision.redirect: true\` to route image turns to a local vision model.`, "vision");
       }
       if (model && deepseekRealId(model)) {
         handleDeepSeek(req, res, body, reqPath, null);

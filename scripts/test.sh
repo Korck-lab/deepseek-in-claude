@@ -324,10 +324,15 @@ else
 fi
 
 # Vision redirect (ADR-0004): a DeepSeek-bound request carrying an image block is
-# rerouted to a vision-capable Anthropic model instead of 400ing upstream. V1 is
-# one real claude-opus-5 answer (tiny cost, mirrors T8's real-API pattern); V2/V3
-# prove the gates against the mock. 1x1 transparent PNG so the real model accepts
-# the image.
+# rerouted to a model that can see it instead of 400ing upstream — the local leg
+# when `vision.redirect` is on, the Anthropic leg otherwise. V1/V4/V5 drive the
+# local leg against the mock; V6 is one real claude-sonnet-5 answer through the
+# Anthropic tier (tiny cost, mirrors T8's real-API pattern); V2/V3/V7 prove the
+# gates. The Anthropic leg's host is hardcoded to api.anthropic.com on purpose
+# (ADR-0002 — it carries the plan OAuth token), so the mock cannot stand in for
+# it: the body rewrite is covered as a pure function in test-parsing.sh, and the
+# routing decision here is asserted by where the request did *not* go.
+# 1x1 transparent PNG so the real model accepts the image.
 PNG="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 # max_tokens is a realistic Claude Code field and keeps the mock's echo tight.
 IMG_BODY='{"model":"claude-deepseek-v4-flash[1m]","stream":true,"max_tokens":32,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"'"$PNG"'"}},{"type":"text","text":"Reply with exactly: OK"}]}]}'
@@ -362,37 +367,95 @@ else
   echo "FAIL V1 could not start proxy with vision config"
 fi
 
+# Both tiers explicitly off — the only configuration that leaves an image turn on
+# DeepSeek to 400. `anthropic: false` is required here: with it absent the turn
+# would leave for the Anthropic leg and this case would stop testing the local
+# gate at all.
 cat >"$TMP/vision-off.yml" <<'EOF'
 port: 8011
 vision:
   redirect: false
+  anthropic: false
 EOF
 if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8011 --port 8011 --config "$TMP/vision-off.yml"; then
   V2="$(curl -s --max-time 5 -X POST http://localhost:8011/v1/messages -H "content-type: application/json" -d "$IMG_BODY")"
-  check "V2 vision.redirect false leaves image on deepseek" 'echo "$V2" | grep -q "ROUTED:deepseek-v4-flash"'
+  check "V2 both vision tiers off leaves image on deepseek" 'echo "$V2" | grep -q "ROUTED:deepseek-v4-flash"'
 else
   echo "FAIL V2 could not start proxy with vision-off config"
 fi
 
-# V6 — the opt-in contract (ADR-0004 decision 7). Every other V case names
-# `redirect: true`, so they pass on either default; only a config with no vision
-# block at all distinguishes opt-in from opt-out. Absent is a different path
-# through `CFG.vision?.redirect` than V2's explicit false, so both stay.
+# V6 — the default contract (ADR-0004 decision 7, amended). A config with no
+# vision block at all is the shape every installed config.yml has: the local leg
+# stays opt-in, and the Anthropic tier catches the turn. This is the one case that
+# distinguishes the two defaults from each other, and the one real-API call in the
+# vision section. The sentinel is what lets the credential bridge swap in the plan
+# token, exactly as V1 does.
 cat >"$TMP/vision-absent.yml" <<'EOF'
 port: 8018
+sentinel: test-vision-sentinel
 EOF
-PROXY_ERR="$TMP/vision-absent.err"
 if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8018 --port 8018 --config "$TMP/vision-absent.yml"; then
-  V6="$(curl -s --max-time 5 -X POST http://localhost:8018/v1/messages -H "content-type: application/json" -d "$IMG_BODY")"
-  check "V6 no vision block leaves image on deepseek (redirect is opt-in)" 'echo "$V6" | grep -q "ROUTED:deepseek-v4-flash"'
+  V6="$(curl -s --max-time 60 -X POST http://localhost:8018/v1/messages -H "content-type: application/json" -H "authorization: Bearer test-vision-sentinel" -H "anthropic-version: 2023-06-01" -d "$IMG_BODY")"
+  # Hermetic half: wherever the turn ended up, it was neither of the two legs a
+  # mock can see. These two pass with or without working Anthropic credentials.
+  check "V6 no vision block does not leave the image on deepseek" '! echo "$V6" | grep -q "ROUTED:"'
   check "V6a no vision block never reaches the local vision leg" '! echo "$V6" | grep -q "LOCAL_VISION:"'
-  # The turn that stays put dies upstream; the warning is what makes that
-  # failure actionable instead of reading like a CLI problem.
-  check "V6b disabled redirect warns and names the setting" 'grep -q "vision.redirect: true" "$TMP/vision-absent.err"'
+  # Real-API half: a live answer proves the tier end to end, and that it still
+  # echoes the display id rather than claude-sonnet-5 (ADR-0001). Skipped rather
+  # than failed when the plan itself refuses the call — a 429 or a 401 here says
+  # nothing about the routing the hermetic half already proved, and the same
+  # answer comes back for a plain non-redirected turn on that plan. The list is
+  # deliberately narrow: `invalid_request_error` means the body this tier built
+  # is wrong, which is exactly the bug this test exists to catch, so it must fail
+  # and not skip.
+  if echo "$V6" | grep -qE '"type":"(rate_limit_error|authentication_error|permission_error|overloaded_error|api_error)"'; then
+    echo "SKIP V6b-d anthropic vision tier (upstream refused: $(echo "$V6" | sed -n 's/.*"type":"\([a-z_]*_error\)".*/\1/p' | head -1))"
+  else
+    check "V6b anthropic tier answers the image turn" 'echo "$V6" | grep -q "content_block_delta"'
+    check "V6c anthropic-redirected response echoes the display id" 'echo "$V6" | grep -q "\"model\":\"claude-deepseek-v4-flash\[1m\]\"" && ! echo "$V6" | grep -q "\"model\":\"claude-sonnet-5\""'
+    check "V6d anthropic-redirected turn logged with a redirected field" 'grep -q "\"to\":\"claude-sonnet-5\"" "$ROOT/logs/proxy-usage.jsonl"'
+  fi
 else
   echo "FAIL V6 could not start proxy with vision-absent config"
 fi
+
+# V7 — the opt-out warning. With both tiers off the turn dies upstream, and the
+# warning is what makes that failure actionable instead of reading like a CLI
+# problem. Same config shape as V2, watched on stderr instead of the wire.
+cat >"$TMP/vision-none.yml" <<'EOF'
+port: 8019
+vision:
+  redirect: false
+  anthropic: false
+EOF
+PROXY_ERR="$TMP/vision-none.err"
+if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8019 --port 8019 --config "$TMP/vision-none.yml"; then
+  V7="$(curl -s --max-time 5 -X POST http://localhost:8019/v1/messages -H "content-type: application/json" -d "$IMG_BODY")"
+  check "V7 anthropic:false with redirect off keeps the image on deepseek" 'echo "$V7" | grep -q "ROUTED:deepseek-v4-flash"'
+  check "V7a both tiers off warns and names both settings" 'grep -q "vision.anthropic" "$TMP/vision-none.err" && grep -q "vision.redirect: true" "$TMP/vision-none.err"'
+else
+  echo "FAIL V7 could not start proxy with vision-none config"
+fi
 unset PROXY_ERR
+
+# V8 — tier precedence. Both configured: the local leg is opt-in, so a user who
+# named it asked for it, and it costs no plan traffic. The Anthropic tier must not
+# steal the turn.
+cat >"$TMP/vision-both.yml" <<'EOF'
+port: 8021
+vision:
+  redirect: true
+  baseUrl: http://localhost:__MOCK__
+  anthropic:
+    model: claude-sonnet-5
+EOF
+sed "s/__MOCK__/$MOCK_PORT/" "$TMP/vision-both.yml" > "$TMP/vision-both-mock.yml"
+if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8021 --port 8021 --config "$TMP/vision-both-mock.yml"; then
+  V8="$(curl -s --max-time 30 -X POST http://localhost:8021/v1/messages -H "content-type: application/json" -d "$IMG_BODY")"
+  check "V8 both tiers configured: the local leg wins" 'echo "$V8" | grep -q "LOCAL_VISION:"'
+else
+  echo "FAIL V8 could not start proxy with both-tier config"
+fi
 
 # A redir-routed family name is DeepSeek-bound too, so the image check fires — but
 # the response must still echo `sonnet`, the id the client sent. Echoing a DeepSeek

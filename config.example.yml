@@ -48,25 +48,37 @@ effort:
   xhigh: max    # other-family "xhigh"  -> DeepSeek "max"
 
 # Route image-bearing requests away from vision-less models.
-# DeepSeek V4 has no vision, so an image block in a request 400s upstream. Turned
-# on, a turn carrying an image goes to a local vision model instead — LM Studio
-# by default, which speaks OpenAI protocol, so this leg translates
-# Anthropic <-> OpenAI. No Anthropic plan traffic: an image turn costs only local
-# inference.
+# DeepSeek V4 has no vision, so an image block in a request 400s upstream. Two
+# tiers catch that turn instead, tried in this order:
 #
-# Off by default, because the redirect only works if you are running that server,
-# and turning it on sends your prompt and image to it — a host the proxy would
-# otherwise never contact — and answers you out of a model you did not pick in
-# `/model`. One proxy serves every project, so this applies to all of them at
-# once. Left off, an image turn fails upstream and the proxy says why.
+#   1. `redirect: true` — a local vision model, LM Studio by default. It speaks
+#      OpenAI protocol, so this leg translates Anthropic <-> OpenAI. No Anthropic
+#      plan traffic: an image turn costs only local inference. Off by default,
+#      because it only works if you are running that server, and turning it on
+#      sends your prompt and image to a host the proxy would otherwise never
+#      contact. baseUrl is the OpenAI-compatible server; model is the
+#      vision-capable id it reports on /v1/models.
+#   2. `anthropic:` — the Anthropic leg the proxy already talks to, on the plan
+#      credential the credential bridge already holds (`authBridge` must be on,
+#      or these turns answer 401). On by default: it names no new host and needs
+#      nothing running, and the alternative is a hard 400 on every image turn.
+#      It does spend plan traffic per image — set `anthropic: false` to turn the
+#      tier off and get the 400 back, with a warning naming these settings.
+#      `model` defaults to claude-sonnet-5 and `effort` to medium; both accept
+#      any Anthropic model id and any of low/medium/high/xhigh/max. Set
+#      `effort: false` to send no effort field at all — older models (Haiku 4.5,
+#      Sonnet 4.5) reject the parameter outright, so a model swap may need it.
 #
-# baseUrl is the OpenAI-compatible server; model is the vision-capable id it
-# reports on /v1/models. Redirected turns are tagged `redirected` in
-# logs/proxy-usage.jsonl. See docs/adr/0004.
+# The response echoes the model you picked in `/model`, not the model that
+# answered, so a resumed session keeps its model either way. Redirected turns are
+# tagged `redirected` in logs/proxy-usage.jsonl. See docs/adr/0004.
 vision:
   redirect: false
   baseUrl: http://127.0.0.1:1234
   model: prism-ml/bonsai-27b
+  anthropic:
+    model: claude-sonnet-5
+    effort: medium
 
 # Per-model capability overrides, for providers that don't report them.
 # Wins over both the per-family default and any value fetched from /v1/models.

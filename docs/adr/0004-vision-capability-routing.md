@@ -1,8 +1,10 @@
-# ADR-0004 — Image-bearing requests redirect from vision-less models to a local vision model
+# ADR-0004 — Image-bearing requests redirect from vision-less models to one that can see
 
 Date: 2026-08-12
 Status: Accepted (amended 2026-08-16 — the redirect target is a local model, not an
-Anthropic one; and, later the same day, the redirect is opt-in rather than on by default)
+Anthropic one; and, later the same day, the redirect is opt-in rather than on by
+default. Amended 2026-08-21 — the Anthropic leg returns as a second tier behind
+the opt-in local one, on by default, targeting claude-sonnet-5 at medium effort.)
 
 ## Context
 
@@ -26,11 +28,22 @@ the fix. A local vision model serves the same need at zero plan cost: LM Studio
 speaks OpenAI protocol rather than Anthropic, so the redirect leg translates
 between the two instead of forwarding to `api.anthropic.com`.
 
+Making that local leg opt-in (below) left a gap the original decision did not
+have: with no `vision:` block — the shape every installed `config.yml` ships with
+— an image turn 400s. The warning names the setting, but the setting only helps a
+user who is running LM Studio. Everyone else is back to the hard failure this ADR
+was written to remove, and the fix on offer requires standing up a server. The
+Anthropic leg is already there, already authenticated, and already the leg the
+proxy talks to for every non-DeepSeek turn; the objection that retired it was
+cost and credit-dependence, not correctness. As a *second tier behind* the local
+one, it pays that cost only when the free option is not configured.
+
 ## Decision
 
 The proxy detects image-bearing requests at route time and, when the resolved
-target model is not vision-capable, rewrites the request for a configured local
-vision model and forwards it to that model's OpenAI-compatible endpoint.
+target model is not vision-capable, reroutes the turn to a model that can see it
+— the configured local vision model when that leg is turned on, the Anthropic leg
+otherwise.
 
 1. **Detection is a recursive walk anchored on the `type` field.** `hasImageBlock`
    walks the parsed JSON body and matches any object whose `type` is `"image"`.
@@ -71,7 +84,43 @@ vision model and forwards it to that model's OpenAI-compatible endpoint.
    resumed session keeps the model the user picked and the next image turn
    re-redirects. This is ADR-0001's display-id contract applied here; the same
    contract the original Anthropic redirect enforced via `restoreClientModel`.
-7. **Redirect is opt-in — `vision.redirect: true`, off otherwise.** It was on by
+7. **The local leg is opt-in; the Anthropic leg is the default tier behind it.**
+   Precedence is local, then Anthropic, then the warning — the local leg wins when
+   both are configured, because it is the one the user turned on by name and the
+   one that spends nothing. `vision.anthropic` is boolean-or-object, the shape
+   `redir` already uses: `false` disables the tier, an object sets `model`
+   (default `claude-sonnet-5`) and `effort` (default `medium`), absent takes the
+   defaults. Sonnet 5 is the cheapest current model that can see, and medium
+   effort is enough to read a screenshot without paying max-effort thinking for
+   it; both legs of that default are one config key away from anything else.
+   `rewriteVision` swaps those two fields and leaves the rest of the body alone —
+   both legs speak Anthropic, so there is no translation to do. `effort: false`
+   sends no effort field at all, which models older than the current tier need:
+   Haiku 4.5 answers `This model does not support the effort parameter`.
+
+   The response is restored by `restoreRedirectedModel`, not `restoreClientModel`.
+   The difference is load-bearing and was found by running the leg for real:
+   Anthropic answers an alias with its dated snapshot, so a request for
+   `claude-haiku-4-5` echoes `claude-haiku-4-5-20251001`, and the
+   equality-anchored rewrite the DeepSeek leg uses finds nothing and no-ops. The
+   turn still answers, so nothing looks wrong until a reconnect restores the
+   session to a model the user never picked — the exact ADR-0001 failure, arriving
+   silently and far from its cause. The redirect leg therefore rewrites the first
+   `model` field in the buffered head rather than a named one. The DeepSeek leg
+   keeps the named rewrite: it echoes the id it was sent, and the narrower rule is
+   what keeps prose naming a model from being rewritten.
+
+   Defaulting a tier *on* is the posture ADR-0005 rejected for fallback, and the
+   difference is worth naming rather than glossing. Fallback fires on any upstream
+   error, silently crosses to a provider the user is not paying attention to, and
+   spends metered credits on a routine 429. This fires only on an image block
+   against a vision-less model — a turn that has exactly one other outcome, a hard
+   400 — on the plan the user is already on, through the leg the proxy already
+   talks to, with no new host named and nothing to install. The asymmetry is not
+   that this crossing is harmless; it is that the alternative is a guaranteed
+   failure rather than a working turn on the other provider.
+
+8. **The local redirect stays opt-in — `vision.redirect: true`, off otherwise.** It was on by
    default when the target was an Anthropic model the user was already paying for
    and already talking to; a hard 400 was the worse answer. Naming a *local* target
    changed what the default asserts. The redirect now ships the prompt and the image
@@ -83,19 +132,28 @@ vision model and forwards it to that model's OpenAI-compatible endpoint.
    and the disabled path warns which setting would have handled it, so the failure
    is actionable rather than opaque. No credential bridge is involved either way —
    the leg needs no auth, so the old startup warning about the bridge is gone.
-8. **Redirected legs that answer are logged.** The usage log gains a `redirected:
+9. **Redirected legs that answer are logged.** The usage log gains a `redirected:
    {to, reason: "vision"}` field; without it those turns are invisible. A redirect
    that fails upstream logs nothing, matching the rest of the log's contract: it
-   records answered turns, and a failed one bills nothing to account for.
+   records answered turns, and a failed one bills nothing to account for. The one
+   exception is a socket error on the Anthropic tier, which logs a 502 with the
+   `redirected` field: nothing else in the ledger would otherwise show that the
+   turn was routed away, and unlike an upstream status this is the proxy's own
+   leg failing, which is worth a line.
 
 ## Consequences
 
-- **Once turned on, image turns no longer 400, and never cost Anthropic plan
-  traffic.** A pasted screenshot, an image in context, or a tool-returned image
-  routes to a local model that can actually see it, and the session model is
-  unchanged for the turns that follow. This works on a week with zero Anthropic
-  credits. Until turned on, image turns fail exactly as they did before the
-  feature existed — with a warning naming the setting.
+- **Image turns no longer 400 out of the box.** A pasted screenshot, an image in
+  context, or a tool-returned image routes to a model that can actually see it,
+  and the session model is unchanged for the turns that follow. With
+  `vision.redirect: true` that costs nothing but local inference and works on a
+  week with zero Anthropic credits; without it, it costs one Sonnet 5 call per
+  image on the user's plan. Both tiers off is still the old behavior — a 400 with
+  a warning naming the settings.
+- **An image turn can now spend plan traffic without the user configuring
+  anything.** That is the deliberate trade for removing the default 400, and it is
+  bounded: image turns only, one call each, on the cheapest vision-capable model.
+  `vision.anthropic: false` opts out.
 - **The routing rule is capability-driven, not family-hardcoded.** Adding a
   vision-capable DeepSeek-class model later is a one-line `capabilities:` override
   or, if upstream starts reporting the field, nothing at all.
@@ -114,13 +172,22 @@ vision model and forwards it to that model's OpenAI-compatible endpoint.
   running, the leg answers a clear 502 naming the base URL, rather than a hard
   upstream 400. This is the visible trade for cutting the plan dependency.
 
-Guarded by `scripts/test-parsing.sh` (pure `hasImageBlock` / `anthropicToOpenAI`
-slices) and `scripts/test.sh` mock-upstream cases (redirect on/off, capability
-override, negative control, local-model echo). The opt-in default has exactly one
-guard, `V6`: every other case sets `redirect: true` explicitly and so passes under
-either default. `V6` runs a config with no `vision` block at all and asserts the
-image stays on DeepSeek and the warning names the setting. `V2` covers explicit
-`false`, a different path through `CFG.vision?.redirect`; neither replaces the other.
+Guarded by `scripts/test-parsing.sh` (pure `hasImageBlock` / `anthropicToOpenAI` /
+`rewriteVision` slices) and `scripts/test.sh` mock-upstream cases (redirect
+on/off, capability override, negative control, local-model echo, tier
+precedence). The two defaults have one guard each. `V6` runs a config with no
+`vision` block at all — the shape every installed config has — and asserts the
+turn leaves both mock-visible legs, that a real Sonnet 5 answer comes back, and
+that it echoes the display id; `V7` sets `anthropic: false` with the local leg off
+and asserts the image stays on DeepSeek with a warning naming both settings. `V2`
+covers the same both-off state on the wire rather than on stderr.
+
+The Anthropic leg's host is hardcoded to `api.anthropic.com` (ADR-0002 — it
+carries the plan OAuth token), so the mock cannot stand in for it and `V6` is a
+real-API case, the pattern `T8` already uses. Making that host configurable would
+turn a test affordance into a way to point a credential-bearing leg at an
+arbitrary host, which is precisely what ADR-0002 forbids. The body rewrite is
+covered hermetically instead, as a pure function.
 
 ## Alternatives rejected
 
@@ -131,6 +198,10 @@ the user picked), violating the session-model contract ADR-0001 exists to protec
 **Keep the Anthropic redirect and make it opt-in** — preserves the old behavior
 for people who want plan-traffic vision, but leaves the no-credits failure mode
 in place for everyone else, and splits the leg's behavior across two targets.
+*(Superseded 2026-08-21: the split is what the two-tier shape accepts, and the
+no-credits mode is what the local tier answers. Opt-in for the Anthropic leg
+specifically was still rejected — a default-off tier behind another default-off
+tier leaves the out-of-the-box 400 exactly where it was.)*
 
 **Let the existing error-fallback retry the image on another leg** — the
 fallback fires only after an upstream error, and the failure mode here is a 400
