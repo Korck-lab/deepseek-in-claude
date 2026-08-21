@@ -89,12 +89,9 @@ vision:
 capabilities:
   deepseek-v4-flash:
     vision: false
-  # DeepSeek ships a vision-capable model, and the per-family default marks it
-  # blind like the rest. Without this pin an image turn on it is redirected away
-  # to the Anthropic tier — overriding the model you deliberately picked, and
-  # spending plan traffic to do it.
-  deepseek-v4-flash-vision-exp:
-    vision: true
+  # deepseek-v4-flash-vision-exp needs no entry: an id that names `vision` (or
+  # `vl`) is read as vision-capable even outside the claude family. Pin it here
+  # only to contradict that — either way an explicit entry always wins.
 
 # Anthropic credential bridge. Claude Code only runs gateway model discovery
 # when ANTHROPIC_AUTH_TOKEN is set, and that value would otherwise override your

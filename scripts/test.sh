@@ -21,10 +21,27 @@ FAIL=0
 
 cleanup() {
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
+  # A TERM'd proxy drains in-flight responses for up to SHUTDOWN_GRACE (5s) before
+  # exiting, so it is still alive for a moment after the signal — that is correct
+  # behaviour, not a hang. Wait it out, then escalate: a proxy that outlives its
+  # own grace window holds a port the next run needs, and orphans accumulated this
+  # way are invisible until something else fails to bind.
+  local i=0
+  while [ "$i" -lt 40 ]; do
+    local alive=false
+    for p in "${PIDS[@]:-}"; do kill -0 "$p" 2>/dev/null && alive=true; done
+    [ "$alive" = false ] && break
+    sleep 0.2
+    i=$((i + 1))
+  done
+  for p in "${PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null; done
   wait 2>/dev/null
   rm -rf "$TMP"
 }
-trap cleanup EXIT
+# EXIT alone misses the ways a run actually dies: Ctrl-C, a closed terminal, a
+# CI timeout. Those left the proxies of six earlier runs listening on 8022-8027
+# with their configs already deleted.
+trap cleanup EXIT INT TERM HUP
 
 check() { # check NAME CONDITION
   if eval "$2"; then PASS=$((PASS + 1)); echo "PASS  $1";
@@ -511,6 +528,30 @@ if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8014 --
   check "V5b non-streaming answer is not the raw JSON envelope" '! echo "$V5" | grep -q "chatcmpl-ns"'
 else
   echo "FAIL V5 could not start proxy with vision-ns config"
+fi
+
+# V9 — a model whose id names vision is not redirected, with no config to say so.
+# DeepSeek reports no capabilities at all, so before this the family default called
+# deepseek-v4-flash-vision-exp blind and sent its image turns to the Anthropic tier
+# — overriding a vision model the user picked on purpose. `redirect: true` here so
+# a regression lands on the visible local leg rather than on real plan traffic.
+cat >"$TMP/vision-id.yml" <<EOF
+port: 8033
+vision:
+  redirect: true
+  baseUrl: http://localhost:$MOCK_PORT
+  model: prism-ml/bonsai-27b
+EOF
+IMG_VIS_BODY='{"model":"claude-deepseek-v4-flash-vision-exp[1m]","stream":true,"max_tokens":32,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"'"$PNG"'"}},{"type":"text","text":"Reply with exactly: OK"}]}]}'
+if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8033 --port 8033 --config "$TMP/vision-id.yml"; then
+  V9="$(curl -s --max-time 10 -X POST http://localhost:8033/v1/messages -H "content-type: application/json" -d "$IMG_VIS_BODY")"
+  check "V9 an id naming vision keeps its image turn" 'echo "$V9" | grep -q "ROUTED:deepseek-v4-flash-vision-exp"'
+  check "V9a and never reaches the vision redirect leg" '! echo "$V9" | grep -q "LOCAL_VISION:"'
+  # Control on the same proxy: the blind sibling still redirects.
+  V9B="$(curl -s --max-time 10 -X POST http://localhost:8033/v1/messages -H "content-type: application/json" -d "$IMG_BODY")"
+  check "V9b its blind sibling still redirects" 'echo "$V9B" | grep -q "LOCAL_VISION:"'
+else
+  echo "FAIL V9 could not start proxy with vision-id config"
 fi
 
 cat >"$TMP/vision-cap.yml" <<'EOF'

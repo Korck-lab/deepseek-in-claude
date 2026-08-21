@@ -27,6 +27,8 @@ trap 'rm -rf "$WORK"' EXIT INT TERM
   sed -n '/^function restoreClientModel/,/^}$/p' "$REPO/proxy.mjs"
   sed -n '/^function rewriteVision/,/^}$/p' "$REPO/proxy.mjs"
   sed -n '/^function restoreRedirectedModel/,/^}$/p' "$REPO/proxy.mjs"
+  sed -n '/^const VISION_IN_ID/p' "$REPO/proxy.mjs"
+  sed -n '/^function visionDefaultFor/,/^}$/p' "$REPO/proxy.mjs"
   cat <<'CASES'
 
 let fails = 0;
@@ -36,7 +38,7 @@ const eq = (label, got, want) => {
   console.log(`${ok ? "ok  " : "FAIL"} ${label}: got ${JSON.stringify(got)} want ${JSON.stringify(want)}`);
 };
 
-for (const fn of [loadYaml, normalizeModel, familyOf, hasImageBlock, anthropicToOpenAI, restoreClientModel, rewriteVision, restoreRedirectedModel]) {
+for (const fn of [loadYaml, normalizeModel, familyOf, hasImageBlock, anthropicToOpenAI, restoreClientModel, rewriteVision, restoreRedirectedModel, visionDefaultFor]) {
   if (typeof fn !== "function") { console.error("extraction failed"); process.exit(2); }
 }
 
@@ -165,6 +167,17 @@ eq(
   'data: {"text":"I used claude-opus-5 for this"}'
 );
 eq("identical ids are a no-op", restoreClientModel(startEvent("claude-opus-5"), "claude-opus-5", "claude-opus-5"), startEvent("claude-opus-5"));
+
+console.log("-- visionDefaultFor: who can see when nobody reported it --");
+eq("claude family sees", visionDefaultFor("claude-sonnet-5"), true);
+eq("bedrock claude sees", visionDefaultFor("us.anthropic.claude-sonnet-5"), true);
+eq("plain deepseek is blind", visionDefaultFor("deepseek-v4-flash"), false);
+eq("an id naming vision sees", visionDefaultFor("deepseek-v4-flash-vision-exp"), true);
+eq("a -vl id sees", visionDefaultFor("qwen2-vl-7b"), true);
+eq("vision as the whole id sees", visionDefaultFor("vision"), true);
+eq("a substring is not a claim", visionDefaultFor("supervision-model"), false);
+eq("vl inside a word is not a claim", visionDefaultFor("deepseek-vldb"), false);
+eq("nothing is blind", visionDefaultFor(null), false);
 
 console.log("-- restoreRedirectedModel: the id upstream echoes is not the id we sent --");
 eq(

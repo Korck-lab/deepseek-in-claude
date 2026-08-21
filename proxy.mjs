@@ -689,9 +689,19 @@ let dsModelsInFlight = null;
 
 const visionByModel = new Map();
 
+/** Ids that name vision in themselves. DeepSeek ships `deepseek-v4-flash-vision-exp`
+ * and reports no capabilities for it, so the family default below would call it
+ * blind and redirect its image turns away — overriding a vision model the user
+ * picked on purpose, and spending plan traffic to do it. A provider that bothers
+ * to put `vision`/`-vl` in an id is telling us the one thing its model list does
+ * not. Still below the config override and below anything actually reported, so a
+ * wrong guess here is one line in `capabilities:` to correct. */
+const VISION_IN_ID = /(^|[-_])(vision|vl)([-_]|$)/i;
+
 /** Fallback when nobody reported a capability for this id. */
 function visionDefaultFor(id) {
-  return /^(claude-|us\.anthropic\.)/.test(String(id ?? ""));
+  const s = String(id ?? "");
+  return /^(claude-|us\.anthropic\.)/.test(s) || VISION_IN_ID.test(s);
 }
 
 /** Read `capabilities.image_input.supported` off a provider's model-list entry.

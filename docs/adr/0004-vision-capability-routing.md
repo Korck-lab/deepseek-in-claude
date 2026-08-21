@@ -7,7 +7,9 @@ default. Amended 2026-08-21 — the Anthropic leg returns as a second tier behin
 the opt-in local one, on by default, targeting claude-sonnet-5 at medium effort.
 Amended 2026-08-21 — the premise below is corrected: DeepSeek no longer 400s an
 image block, it answers 200 without having seen it. The decision is unchanged and
-the case for it is stronger.)
+the case for it is stronger. Also amended 2026-08-21 — the default below reads a
+`vision`/`vl` marker in the id, so a vision-capable model outside the claude
+family keeps its own image turns.)
 
 ## Context
 
@@ -75,12 +77,23 @@ otherwise.
    survive.
 3. **Capabilities come from a map with three sources, in precedence order:**
    explicit `capabilities:` config overrides, values read from a provider's own
-   model list, then a per-family default — `true` for `claude-*`, `false` for
-   everything else. Both model-list fetches the proxy already makes run the same
-   reader: Anthropic's reports `capabilities.image_input.supported` today, and
-   DeepSeek's does not, so its models keep the family default. The reader on the
-   DeepSeek list is the extensibility point — a list that starts reporting the
-   field stops the redirect for that model with no code change.
+   model list, then a default read off the id — `true` for `claude-*` and for any
+   id naming `vision` or `vl`, `false` for everything else. Both model-list fetches
+   the proxy already makes run the same reader: Anthropic's reports
+   `capabilities.image_input.supported` today, and DeepSeek's does not, so its
+   models fall through to that default. The reader on the DeepSeek list is the
+   extensibility point — a list that starts reporting the field stops the redirect
+   for that model with no code change.
+
+   The id marker was added 2026-08-21, when DeepSeek's list turned out to carry
+   `deepseek-v4-flash-vision-exp`. A pure per-family rule called it blind, so the
+   one model in the catalogue that can already see would have had its image turns
+   taken away from it and billed to the plan — a user picking a vision model on
+   purpose, silently overruled. Reading the id is a guess where reported
+   capability is a fact, which is why it sits at the bottom of the precedence
+   chain: a wrong guess is one `capabilities:` line to correct, and the pattern is
+   anchored on token boundaries so `supervision-model` is not mistaken for a
+   claim.
 4. **The check fires before dispatch, independent of the error-fallback
    machinery.** In `handle()`, before the DeepSeek branches, a request that has
    an image, resolves to a DeepSeek-bound target, and is routed to a model whose

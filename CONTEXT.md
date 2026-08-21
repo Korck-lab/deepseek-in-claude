@@ -85,8 +85,10 @@ Both tiers off, the image turn goes to DeepSeek, which answers 200 without havin
 seen the image, and the disabled path warns which settings would have handled it. Either tier's response echoes the client's display id
 so the session model survives, and is tagged `redirected` in the usage log. Distinct
 from *fallback* — both redirect legs forward with `fb: null` on purpose. Capabilities
-are fetched from `/v1/models` when reported, defaulted per family otherwise, and
-overridable in the `capabilities:` config block. See ADR-0004.
+are fetched from `/v1/models` when reported, defaulted from the id otherwise (the
+`claude-*` family, plus any id naming `vision` or `vl` — DeepSeek reports nothing
+for `deepseek-v4-flash-vision-exp`, which would otherwise be redirected away from
+a turn it can handle), and overridable in the `capabilities:` config block. See ADR-0004.
 
 ## Shape of proxy.mjs
 
