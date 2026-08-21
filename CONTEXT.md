@@ -76,13 +76,13 @@ tiers in this order:
 2. **Anthropic leg** — `claude-sonnet-5` at `medium` effort by default, on the plan
    credential the bridge already holds (`authBridge` must be on, or these turns 401).
    **On by default**: it names no new host, needs nothing running, and the only other
-   outcome for an image turn is a hard 400. Costs plan traffic per image; turn it off
+   outcome for an image turn is a blind answer. Costs plan traffic per image; turn it off
    with `vision.anthropic: false`. `rewriteVision` swaps `model` and
    `output_config.effort` and leaves the body otherwise untouched — both legs speak
    Anthropic, so nothing is translated.
 
-Both tiers off, the image turn 400s upstream and the disabled path warns which
-settings would have handled it. Either tier's response echoes the client's display id
+Both tiers off, the image turn goes to DeepSeek, which answers 200 without having
+seen the image, and the disabled path warns which settings would have handled it. Either tier's response echoes the client's display id
 so the session model survives, and is tagged `redirected` in the usage log. Distinct
 from *fallback* — both redirect legs forward with `fb: null` on purpose. Capabilities
 are fetched from `/v1/models` when reported, defaulted per family otherwise, and

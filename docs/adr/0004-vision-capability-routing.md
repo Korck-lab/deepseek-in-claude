@@ -4,15 +4,26 @@ Date: 2026-08-12
 Status: Accepted (amended 2026-08-16 — the redirect target is a local model, not an
 Anthropic one; and, later the same day, the redirect is opt-in rather than on by
 default. Amended 2026-08-21 — the Anthropic leg returns as a second tier behind
-the opt-in local one, on by default, targeting claude-sonnet-5 at medium effort.)
+the opt-in local one, on by default, targeting claude-sonnet-5 at medium effort.
+Amended 2026-08-21 — the premise below is corrected: DeepSeek no longer 400s an
+image block, it answers 200 without having seen it. The decision is unchanged and
+the case for it is stronger.)
 
 ## Context
 
 DeepSeek V4 models have no vision. A Claude Code request whose body carries an
 image block — pasted into the prompt, dropped into the context, or returned by a
-tool — currently 400s upstream, because DeepSeek's Anthropic-compatible endpoint
-rejects `{"type":"image"}` content it cannot process. The failure is a hard one:
-the turn dies with an opaque upstream error instead of degrading.
+tool — used to 400 upstream, because DeepSeek's Anthropic-compatible endpoint
+rejected `{"type":"image"}` content it could not process.
+
+Measured again 2026-08-21, that is no longer what happens, and the new behaviour is
+worse. DeepSeek accepts the image block and answers 200 without having seen it. Sent
+a 1x1 `rgba(255,0,0,127)` pixel and asked its colour it answered "blue"; sent a
+64x64 image split green/yellow it answered "Cannot determine." The same two requests
+through the redirect answered "Pink" (correct — half-alpha red on white) and
+"Green, yellow". So the failure is silent: the user gets a fluent, confident answer
+about an image the model never saw, with nothing in the response marking it as
+blind. A hard 400 at least announced itself.
 
 The proxy knows which leg a request is bound for before dispatch. It also knows —
 or can know — which models are vision-capable: since 2026-03 Anthropic's
@@ -122,7 +133,7 @@ otherwise.
 
 8. **The local redirect stays opt-in — `vision.redirect: true`, off otherwise.** It was on by
    default when the target was an Anthropic model the user was already paying for
-   and already talking to; a hard 400 was the worse answer. Naming a *local* target
+   and already talking to; a blind answer was the worse outcome. Naming a *local* target
    changed what the default asserts. The redirect now ships the prompt and the image
    to a host the proxy would otherwise never contact, one the user has to be running
    for it to work at all, and answers out of a model they did not pick in `/model`.
@@ -143,7 +154,7 @@ otherwise.
 
 ## Consequences
 
-- **Image turns no longer 400 out of the box.** A pasted screenshot, an image in
+- **Image turns are no longer answered blind out of the box.** A pasted screenshot, an image in
   context, or a tool-returned image routes to a model that can actually see it,
   and the session model is unchanged for the turns that follow. With
   `vision.redirect: true` that costs nothing but local inference and works on a
@@ -169,8 +180,9 @@ otherwise.
 - **The check adds a body scan per request.** A recursive JSON walk on every
   messages request; negligible next to the upstream round trip it gates.
 - **A redirected turn depends on the local server being up.** If LM Studio is not
-  running, the leg answers a clear 502 naming the base URL, rather than a hard
-  upstream 400. This is the visible trade for cutting the plan dependency.
+  running, the leg answers a clear 502 naming the base URL. A loud 502 is the
+  visible trade for cutting the plan dependency — and still preferable to the
+  silent wrong answer the unredirected path now gives.
 
 Guarded by `scripts/test-parsing.sh` (pure `hasImageBlock` / `anthropicToOpenAI` /
 `rewriteVision` slices) and `scripts/test.sh` mock-upstream cases (redirect
@@ -181,6 +193,16 @@ turn leaves both mock-visible legs, that a real Sonnet 5 answer comes back, and
 that it echoes the display id; `V7` sets `anthropic: false` with the local leg off
 and asserts the image stays on DeepSeek with a warning naming both settings. `V2`
 covers the same both-off state on the wire rather than on stderr.
+
+`V6`'s request body carries the Claude Code identity block as `system[0]`, and that
+is load-bearing rather than decoration. A plan OAuth token is gated on it: the same
+request without that block comes back `429 rate_limit_error` with an opaque
+`"message":"Error"`, for `claude-sonnet-5` but not for `claude-haiku-4-5`, which is
+exempt. Hand-testing this leg with a curl body that omits it therefore reads as a
+plan rate limit, and the model-specific behaviour makes that reading look confirmed.
+It cost real time on 2026-08-21. Real Claude Code always sends the block and
+`rewriteVision` preserves it, so this never affects live traffic — only tests and
+hand probes.
 
 The Anthropic leg's host is hardcoded to `api.anthropic.com` (ADR-0002 — it
 carries the plan OAuth token), so the mock cannot stand in for it and `V6` is a

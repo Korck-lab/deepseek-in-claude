@@ -433,12 +433,17 @@ let refreshInFlight = null;
 //   2. The Anthropic leg the proxy is already talking to, on the plan credential
 //      the credential bridge already holds. On by default: unlike the local leg
 //      it names no new host, needs nothing running, and spends the plan the user
-//      is already on — and the alternative is a hard 400 on every image turn.
-//      It does cost plan traffic per image, so `vision.anthropic: false` turns
-//      it off and restores the 400-with-a-warning.
+//      is already on — and the alternative is a confidently wrong answer on
+//      every image turn. It does cost plan traffic per image, so
+//      `vision.anthropic: false` turns it off and restores the blind answer,
+//      with a warning.
 //
-// With both off, an image turn 400s upstream and the disabled path says which
-// setting would have handled it.
+// With both off, the image turn goes to DeepSeek, which answers 200 without
+// having seen the image, and the disabled path says which setting would have
+// handled it. Measured 2026-08-21: DeepSeek used to reject `{"type":"image"}`
+// with a 400; it now accepts the block and hallucinates instead — asked the
+// colour of a solid red pixel it answered "blue". A wrong answer nobody can
+// tell is wrong is a worse failure than the error this originally caught.
 // ---------------------------------------------------------------------------
 
 const VISION_REDIRECT = CFG.vision?.redirect === true;
@@ -1671,7 +1676,7 @@ function handle(req, res) {
         // Both tiers off: the turn is about to 400 upstream on a body the model
         // cannot read. That failure reads like a CLI or model-support problem,
         // so name the settings that change it rather than letting the 400 speak.
-        warnOnce(`image sent to ${dsTarget}, which has no vision — this turn will fail upstream. Set \`vision.anthropic\` back on to answer it on the Anthropic leg, or \`vision.redirect: true\` to route image turns to a local vision model.`, "vision");
+        warnOnce(`image sent to ${dsTarget}, which cannot see it — the turn will answer anyway, without the image. Set \`vision.anthropic\` back on to answer it on the Anthropic leg, or \`vision.redirect: true\` to route image turns to a local vision model.`, "vision");
       }
       if (model && deepseekRealId(model)) {
         handleDeepSeek(req, res, body, reqPath, null);

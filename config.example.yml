@@ -48,7 +48,8 @@ effort:
   xhigh: max    # other-family "xhigh"  -> DeepSeek "max"
 
 # Route image-bearing requests away from vision-less models.
-# DeepSeek V4 has no vision, so an image block in a request 400s upstream. Two
+# DeepSeek V4 has no vision. It does not reject an image block — it answers 200
+# without having seen it, which reads like a real answer and is not one. Two
 # tiers catch that turn instead, tried in this order:
 #
 #   1. `redirect: true` — a local vision model, LM Studio by default. It speaks
@@ -61,9 +62,10 @@ effort:
 #   2. `anthropic:` — the Anthropic leg the proxy already talks to, on the plan
 #      credential the credential bridge already holds (`authBridge` must be on,
 #      or these turns answer 401). On by default: it names no new host and needs
-#      nothing running, and the alternative is a hard 400 on every image turn.
-#      It does spend plan traffic per image — set `anthropic: false` to turn the
-#      tier off and get the 400 back, with a warning naming these settings.
+#      nothing running, and the alternative is a made-up answer on every image
+#      turn. It does spend plan traffic per image — set `anthropic: false` to
+#      turn the tier off and get the blind answer back, with a warning naming
+#      these settings.
 #      `model` defaults to claude-sonnet-5 and `effort` to medium; both accept
 #      any Anthropic model id and any of low/medium/high/xhigh/max. Set
 #      `effort: false` to send no effort field at all — older models (Haiku 4.5,
@@ -87,6 +89,12 @@ vision:
 capabilities:
   deepseek-v4-flash:
     vision: false
+  # DeepSeek ships a vision-capable model, and the per-family default marks it
+  # blind like the rest. Without this pin an image turn on it is redirected away
+  # to the Anthropic tier — overriding the model you deliberately picked, and
+  # spending plan traffic to do it.
+  deepseek-v4-flash-vision-exp:
+    vision: true
 
 # Anthropic credential bridge. Claude Code only runs gateway model discovery
 # when ANTHROPIC_AUTH_TOKEN is set, and that value would otherwise override your

@@ -324,7 +324,7 @@ else
 fi
 
 # Vision redirect (ADR-0004): a DeepSeek-bound request carrying an image block is
-# rerouted to a model that can see it instead of 400ing upstream — the local leg
+# rerouted to a model that can see it instead of being answered blind — the local leg
 # when `vision.redirect` is on, the Anthropic leg otherwise. V1/V4/V5 drive the
 # local leg against the mock; V6 is one real claude-sonnet-5 answer through the
 # Anthropic tier (tiny cost, mirrors T8's real-API pattern); V2/V3/V7 prove the
@@ -335,7 +335,10 @@ fi
 # 1x1 transparent PNG so the real model accepts the image.
 PNG="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 # max_tokens is a realistic Claude Code field and keeps the mock's echo tight.
-IMG_BODY='{"model":"claude-deepseek-v4-flash[1m]","stream":true,"max_tokens":32,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"'"$PNG"'"}},{"type":"text","text":"Reply with exactly: OK"}]}]}'
+# system[0] is the Claude Code identity block, and it is required rather than
+# decorative: a plan OAuth token answers 429 rate_limit_error without it (see
+# ADR-0004's test-guard note). Omit it and V6b-d silently skip forever.
+IMG_BODY='{"model":"claude-deepseek-v4-flash[1m]","system":[{"type":"text","text":"You are Claude Code, Anthropic'"'"'s official CLI for Claude."}],"stream":true,"max_tokens":32,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"'"$PNG"'"}},{"type":"text","text":"Reply with exactly: OK"}]}]}'
 
 cat >"$TMP/vision.yml" <<'EOF'
 port: 8010
@@ -408,7 +411,7 @@ if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8018 --
   # deliberately narrow: `invalid_request_error` means the body this tier built
   # is wrong, which is exactly the bug this test exists to catch, so it must fail
   # and not skip.
-  if echo "$V6" | grep -qE '"type":"(rate_limit_error|authentication_error|permission_error|overloaded_error|api_error)"'; then
+  if echo "$V6" | grep -qE '"type":"(rate_limit_error|authentication_error|permission_error|overloaded_error)"'; then
     echo "SKIP V6b-d anthropic vision tier (upstream refused: $(echo "$V6" | sed -n 's/.*"type":"\([a-z_]*_error\)".*/\1/p' | head -1))"
   else
     check "V6b anthropic tier answers the image turn" 'echo "$V6" | grep -q "content_block_delta"'
