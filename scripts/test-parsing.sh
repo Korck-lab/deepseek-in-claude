@@ -29,6 +29,17 @@ trap 'rm -rf "$WORK"' EXIT INT TERM
   sed -n '/^function restoreRedirectedModel/,/^}$/p' "$REPO/proxy.mjs"
   sed -n '/^const VISION_IN_ID/p' "$REPO/proxy.mjs"
   sed -n '/^function visionDefaultFor/,/^}$/p' "$REPO/proxy.mjs"
+  # Provider-table helpers. The state they read (PROVIDERS / PROVIDER_IDS /
+  # displayToReal / windowByModel) lives beside env reads and live fetches in
+  # proxy.mjs, so it is reconstructed here and the pure functions sliced out of
+  # the real file — the same contract as REDIR_MAP above. A wrong slice shape
+  # fails the extraction check below, not a test case.
+  echo 'const DEFAULT_MODELS = ["deepseek-v4-pro", "deepseek-v4-flash"];'
+  echo 'const PROVIDERS = { deepseek: { name: "DeepSeek", apiKey: "k", root: "r", anthropicBase: "b", prefix: "claude-deepseek-", stripRe: /^deepseek-/, windowDefault: 1_000_000 }, xiaomi: { name: "Mimo", apiKey: "k", root: "r", anthropicBase: "b", prefix: "claude-", stripRe: /^/, windowDefault: null, exclude: /-(asr|tts)(-|$)/i } };'
+  echo 'const PROVIDER_IDS = { deepseek: new Set(DEFAULT_MODELS), xiaomi: new Set(["mimo-v2.5", "mimo-v2.5-pro"]) };'
+  awk '/^const stripWindowSuffix/{p=1} /^function toModelEntry/{p=0} p{print}' "$REPO/proxy.mjs"
+  sed -n '/^function toModelEntry/,/^}$/p' "$REPO/proxy.mjs"
+  sed -n '/^const providerOf/,/^};$/p' "$REPO/proxy.mjs"
   cat <<'CASES'
 
 let fails = 0;
@@ -38,7 +49,7 @@ const eq = (label, got, want) => {
   console.log(`${ok ? "ok  " : "FAIL"} ${label}: got ${JSON.stringify(got)} want ${JSON.stringify(want)}`);
 };
 
-for (const fn of [loadYaml, normalizeModel, familyOf, hasImageBlock, anthropicToOpenAI, restoreClientModel, rewriteVision, restoreRedirectedModel, visionDefaultFor]) {
+for (const fn of [loadYaml, normalizeModel, familyOf, hasImageBlock, anthropicToOpenAI, restoreClientModel, rewriteVision, restoreRedirectedModel, visionDefaultFor, providerOf, displayIdOf, displayNameOf, windowSuffixOf, readContextWindow]) {
   if (typeof fn !== "function") { console.error("extraction failed"); process.exit(2); }
 }
 
@@ -221,6 +232,38 @@ eq(
   JSON.parse(rewriteVision(visionIn(), "claude-sonnet-5", null).toString("utf8")).output_config,
   undefined
 );
+
+console.log("-- displayIdOf: provider prefix + window suffix --");
+eq("deepseek real", displayIdOf("deepseek-v4-flash"), "claude-deepseek-v4-flash[1m]");
+eq("deepseek pro", displayIdOf("deepseek-v4-pro"), "claude-deepseek-v4-pro[1m]");
+eq("xiaomi no known window", displayIdOf("mimo-v2.5"), "claude-mimo-v2.5");
+eq("xiaomi pro", displayIdOf("mimo-v2.5-pro"), "claude-mimo-v2.5-pro");
+eq("non-provider passthrough", displayIdOf("sonnet-5"), "sonnet-5");
+
+console.log("-- displayNameOf: vendor word not doubled --");
+eq("deepseek name", displayNameOf("deepseek-v4-flash"), "DeepSeek V4 Flash");
+eq("xiaomi name", displayNameOf("mimo-v2.5"), "Mimo V2.5");
+
+console.log("-- providerOf: display id, bare id, real id, or null --");
+eq("suffixed display id", providerOf("claude-deepseek-v4-flash[1m]"), { provider: "deepseek", real: "deepseek-v4-flash" });
+eq("bare display id", providerOf("claude-deepseek-v4-flash"), { provider: "deepseek", real: "deepseek-v4-flash" });
+eq("xiaomi display id", providerOf("claude-mimo-v2.5"), { provider: "xiaomi", real: "mimo-v2.5" });
+eq("real id direct", providerOf("mimo-v2.5"), { provider: "xiaomi", real: "mimo-v2.5" });
+eq("client-sent window suffix", providerOf("mimo-v2.5[1m]"), { provider: "xiaomi", real: "mimo-v2.5" });
+eq("anthropic model", providerOf("claude-sonnet-5"), null);
+eq("garbage", providerOf("nope"), null);
+eq("non-string", providerOf(123), null);
+
+console.log("-- windowSuffixOf / readContextWindow: report wins over default --");
+eq("1m", windowSuffixOf(1_000_000), "[1m]");
+eq("750k boundary", windowSuffixOf(750_000), "[1m]");
+eq("200k", windowSuffixOf(200_000), "");
+eq("unknown", windowSuffixOf(null), "");
+readContextWindow({ id: "mimo-v2.5", context_window: 262_144 });
+eq("xiaomi 262k still no suffix", displayIdOf("mimo-v2.5"), "claude-mimo-v2.5");
+readContextWindow({ id: "mimo-v2.5-pro", context_window: 1_000_000 });
+eq("reported 1m earns the suffix", displayIdOf("mimo-v2.5-pro"), "claude-mimo-v2.5-pro[1m]");
+eq("windowed id still routes", providerOf("claude-mimo-v2.5-pro[1m]"), { provider: "xiaomi", real: "mimo-v2.5-pro" });
 
 console.log(fails ? `\n${fails} failing` : "\nall passing");
 process.exit(fails ? 1 : 0);

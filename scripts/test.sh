@@ -105,6 +105,19 @@ http.createServer((req, res) => {
   const chunks = [];
   req.on("data", (c) => chunks.push(c));
   req.on("end", () => {
+    // Provider model lists (the second-provider fetch path). mimno-v2.5-pro
+    // reports a 1M window so the [1m] suffix is testable; the -asr/-tts ids are
+    // what the proxy must filter out of the picker.
+    if (req.url.startsWith("/models")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ data: [
+        { id: "mimo-v2.5", object: "model", created: 1, owned_by: "xiaomi" },
+        { id: "mimo-v2.5-pro", object: "model", created: 1, owned_by: "xiaomi", context_window: 1000000 },
+        { id: "mimo-v2.5-asr", object: "model", created: 1, owned_by: "xiaomi" },
+        { id: "mimo-v2.5-tts-s1", object: "model", created: 1, owned_by: "xiaomi" },
+      ] }));
+      return;
+    }
     let model = "?", effort = "?", advisor = false, future = false;
     try {
       const j = JSON.parse(Buffer.concat(chunks).toString("utf8"));
@@ -567,6 +580,50 @@ if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8012 --
   check "V3 capability override vision:true keeps image on deepseek" 'echo "$V3" | grep -q "ROUTED:deepseek-v4-flash"'
 else
   echo "FAIL V3 could not start proxy with capability config"
+fi
+
+# X — the second provider leg. `claude-mimo-v2.5` is a Xiaomi display id; it must
+# route to the Xiaomi leg (rewritten to the real `mimo-v2.5` upstream), DeepSeek
+# must be untouched, and a vision-pinned mimo image turn must stay on Xiaomi —
+# not fall through to the Anthropic leg or the (off) redirect. The mock /models
+# route feeds the mimo list; XIOMIMIMO_ANTHROPIC_BASE_URL points the leg at the
+# mock and XIOMIMIMO_BASE_URL its list fetch.
+cat >"$TMP/xiaomi.yml" <<'EOF'
+port: 8034
+vision:
+  redirect: false
+  anthropic: false
+capabilities:
+  mimo-v2.5:
+    vision: true
+  mimo-v2.5-pro:
+    vision: true
+EOF
+IMG_MIMO='{"model":"claude-mimo-v2.5","stream":true,"max_tokens":32,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"'"$PNG"'"}},{"type":"text","text":"Reply with exactly: OK"}]}]}'
+if DEEPSEEK_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" XIOMIMIMO_ANTHROPIC_BASE_URL="http://localhost:$MOCK_PORT" XIOMIMIMO_BASE_URL="http://localhost:$MOCK_PORT" start_proxy 8034 --port 8034 --config "$TMP/xiaomi.yml"; then
+  # The mimo list lands asynchronously at boot; wait until it's in before the
+  # routing checks, or a request that lands first falls through to Anthropic.
+  for _ in $(seq 1 30); do
+    if curl -s --max-time 2 "http://localhost:8034/_proxy/deepseek-models" | grep -q "claude-mimo-v2.5"; then break; fi
+    sleep 0.3
+  done
+  X1="$(curl -s --max-time 10 -X POST http://localhost:8034/v1/messages -H "content-type: application/json" -d '{"model":"claude-mimo-v2.5","stream":true,"max_tokens":32,"messages":[{"role":"user","content":"hi"}]}')"
+  check "X1 mimo display id routes to the xiaomi leg" 'echo "$X1" | grep -q "ROUTED:mimo-v2.5"'
+  check "X1a and echoes the display id back" 'echo "$X1" | grep -q "\"model\":\"claude-mimo-v2.5\""'
+
+  X2="$(curl -s --max-time 5 -X POST http://localhost:8034/v1/messages -H "content-type: application/json" -d '{"model":"claude-deepseek-v4-flash[1m]","messages":[{"role":"user","content":"x"}]}')"
+  check "X2 deepseek routing is untouched by the second provider" 'echo "$X2" | grep -q "ROUTED:deepseek-v4-flash"'
+
+  XI="$(curl -s --max-time 10 -X POST http://localhost:8034/v1/messages -H "content-type: application/json" -d "$IMG_MIMO")"
+  check "X3 vision-pinned mimo image stays on the xiaomi leg" 'echo "$XI" | grep -q "ROUTED:mimo-v2.5"'
+  check "X3a and never reaches the redirect leg" '! echo "$XI" | grep -q "LOCAL_VISION:"'
+
+  XML="$(curl -s --max-time 10 http://localhost:8034/_proxy/deepseek-models)"
+  check "X4 model list carries claude-mimo-v2.5" 'echo "$XML" | grep -q "claude-mimo-v2.5"'
+  check "X4a reported 1M earns the [1m] suffix" 'echo "$XML" | grep -q "claude-mimo-v2.5-pro\[1m\]"'
+  check "X4b audio-only models are excluded" '! echo "$XML" | grep -q "asr" && ! echo "$XML" | grep -q "tts"'
+else
+  echo "FAIL X1 could not start proxy with xiaomi config"
 fi
 
 # T8 forward fallback: dead deepseek -> real anthropic

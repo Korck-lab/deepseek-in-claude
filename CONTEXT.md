@@ -1,10 +1,10 @@
 # Context — deepseek-in-claude
 
-A zero-dependency local proxy that makes DeepSeek models selectable inside Claude Code.
-It sits between the CLI and two upstreams, merges their model lists, and routes each
-request to whichever upstream owns the requested model. No protocol translation is
-involved — DeepSeek exposes an Anthropic-compatible endpoint, so the CLI sees native
-Anthropic SSE either way.
+A zero-dependency local proxy that makes provider models (DeepSeek, Xiaomi MiMo)
+selectable inside Claude Code. It sits between the CLI and the upstreams, merges their
+model lists, and routes each request to whichever upstream owns the requested model.
+No protocol translation is involved — each provider exposes an Anthropic-compatible
+endpoint, so the CLI sees native Anthropic SSE either way.
 
 Everything runs from a single file, `proxy.mjs`, on Node built-ins only.
 
@@ -15,16 +15,17 @@ Use these terms; avoid the synonyms noted.
 **Proxy** — the `proxy.mjs` process listening on `PORT` (8016 under the launcher).
 Claude Code reaches it via `ANTHROPIC_BASE_URL`.
 
-**Upstream** — either of the two backends the proxy forwards to: the *Anthropic leg*
-(`api.anthropic.com`) or the *DeepSeek leg* (`api.deepseek.com/anthropic`). Say which
-leg; "the API" is ambiguous here.
+**Upstream** — any backend the proxy forwards to: the *Anthropic leg*
+(`api.anthropic.com`), the *DeepSeek leg* (`api.deepseek.com/anthropic`), or the
+*Xiaomi leg* (`token-plan-sgp.xiaomimimo.com/anthropic`). Say which leg; "the API" is
+ambiguous here. A **provider** is a non-Anthropic upstream — DeepSeek, Xiaomi.
 
 **Display id** — the model id the proxy advertises to Claude Code, e.g.
-`claude-deepseek-v4-flash[1m]`. Both the prefix and the suffix are load-bearing;
-see ADR-0001.
+`claude-deepseek-v4-flash[1m]` or `claude-mimo-v2.5`. Both the prefix and the suffix
+are load-bearing; see ADR-0001.
 
-**Real id** — the id DeepSeek actually accepts, e.g. `deepseek-v4-flash`. The proxy
-keeps a `displayToReal` map and rewrites before forwarding.
+**Real id** — the id a provider actually accepts, e.g. `deepseek-v4-flash`,
+`mimo-v2.5`. The proxy keeps a `displayToReal` map and rewrites before forwarding.
 
 **Gateway model discovery** — the Claude Code feature (enabled by
 `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`) that populates the `/model` picker with
@@ -34,9 +35,10 @@ gateway models. Two halves, and the distinction matters: the *fetch* calls
 `~/.claude/cache/gateway-models.json` and needs no credential. Say which half.
 
 **Seeded model cache** — `~/.claude/cache/gateway-models.json`, written by `claudei.sh`
-from the proxy's `/_proxy/deepseek-models` rather than fetched by the CLI. This is why the
-launcher sets no auth env var and claude.ai connectors keep working; its `baseUrl` must
-match `ANTHROPIC_BASE_URL` byte for byte. See ADR-0003.
+from the proxy's `/_proxy/deepseek-models` (which now serves the merged provider list)
+rather than fetched by the CLI. This is why the launcher sets no auth env var and
+claude.ai connectors keep working; its `baseUrl` must match `ANTHROPIC_BASE_URL` byte
+for byte. See ADR-0003.
 
 **Credential bridge** — the substitution of the caller's sentinel
 `ANTHROPIC_AUTH_TOKEN` for the user's real Claude Code OAuth token on the Anthropic leg.
@@ -54,7 +56,8 @@ it — the seeded model cache removed the reason to — so it is now the opt-in 
 someone setting `ANTHROPIC_AUTH_TOKEN` deliberately, not the default one.
 
 **Redir** — the `--redir` mode that routes Anthropic-family model names
-(haiku/sonnet/opus/fable) to DeepSeek via a mapping. Distinct from *fallback*.
+(haiku/sonnet/opus/fable) to DeepSeek via a mapping. DeepSeek-only in v1 — Xiaomi
+does not participate in `--redir`. Distinct from *fallback*.
 
 **Fallback** — the `--fallback` mode that retries the *other* leg when an upstream
 returns 404/429/5xx. Bidirectional, and **off unless asked for** — it spends the other
@@ -64,9 +67,10 @@ in `$PROXY_HOME/config.yml`; the launcher passes no flag. Crossings are tagged
 `fallbackFrom` in the usage log. See ADR-0005.
 
 **Vision redirect** — the reroute of a request carrying an image block away from a
-vision-less model (DeepSeek V4 has no vision) to one that can see it. Fires at route
-time when the resolved target's capability is `vision: false`, and picks between two
-tiers in this order:
+vision-less model (the base DeepSeek V4 models can't see — `deepseek-v4-flash-vision-exp`
+can, and is left alone; a Xiaomi audio model can't either) to one that can see it.
+Fires at route time when the resolved target's capability is `vision: false`, and
+picks between two tiers in this order:
 
 1. **Local leg** — LM Studio by default (`prism-ml/bonsai-27b` at
    `http://127.0.0.1:1234`), which speaks OpenAI protocol, so this leg translates
@@ -81,14 +85,15 @@ tiers in this order:
    `output_config.effort` and leaves the body otherwise untouched — both legs speak
    Anthropic, so nothing is translated.
 
-Both tiers off, the image turn goes to DeepSeek, which answers 200 without having
+Both tiers off, the image turn goes to the provider, which answers 200 without having
 seen the image, and the disabled path warns which settings would have handled it. Either tier's response echoes the client's display id
 so the session model survives, and is tagged `redirected` in the usage log. Distinct
 from *fallback* — both redirect legs forward with `fb: null` on purpose. Capabilities
 are fetched from `/v1/models` when reported, defaulted from the id otherwise (the
 `claude-*` family, plus any id naming `vision` or `vl` — DeepSeek reports nothing
 for `deepseek-v4-flash-vision-exp`, which would otherwise be redirected away from
-a turn it can handle), and overridable in the `capabilities:` config block. See ADR-0004.
+a turn it can handle; Xiaomi reports nothing either, so `mimo-v2.5`/`mimo-v2.5-pro`
+are pinned capable in the `capabilities:` block), and overridable there. See ADR-0004.
 
 ## Shape of proxy.mjs
 
@@ -99,11 +104,11 @@ Sections in file order:
 | Config | precedence `CLI args > config.yml > .env > defaults` |
 | Payload debug log | `--debug`, one JSON line per request/response |
 | Anthropic credential bridge | sentinel → real OAuth token, optional refresh grant |
-| DeepSeek model list | live fetch, 10-min cache, `.env` fallback, display/real mapping |
+| Provider model lists | per-provider live fetch, 10-min cache, `.env` fallback, display/real mapping |
 | Vision capability map | which models can see images: config override > provider-reported > family default |
-| Usage log | one JSON line per DeepSeek request, always on |
-| DeepSeek routing | transparent forward to the Anthropic-compatible endpoint |
-| Merged model list | serves `GET /v1/models` — union of both legs |
+| Usage log | one JSON line per provider request, always on |
+| Provider routing | transparent forward to each provider's Anthropic-compatible endpoint |
+| Merged model list | serves `GET /v1/models` — union of all legs |
 | Anthropic forward | body untouched (credential headers reworked by the bridge); streams straight through |
 | Local vision leg | `anthropicToOpenAI` (request) + `forwardToLocalVision` (OpenAI SSE → Anthropic SSE) |
 | Image routing helpers | `hasImageBlock` (recursive, anchored on `type`), `rewriteVision` (Anthropic tier), `restoreClientModel` |

@@ -48,8 +48,10 @@ effort:
   xhigh: max    # other-family "xhigh"  -> DeepSeek "max"
 
 # Route image-bearing requests away from vision-less models.
-# DeepSeek V4 has no vision. It does not reject an image block — it answers 200
-# without having seen it, which reads like a real answer and is not one. Two
+# The base DeepSeek V4 models (deepseek-v4-flash, deepseek-v4-pro) have no vision —
+# they do not reject an image block, they answer 200 without having seen it, which
+# reads like a real answer and is not one. (`deepseek-v4-flash-vision-exp` is the
+# exception: it names `vision`, so it is read as capable and never redirected.) Two
 # tiers catch that turn instead, tried in this order:
 #
 #   1. `redirect: true` — a local vision model, LM Studio by default. It speaks
@@ -92,6 +94,12 @@ capabilities:
   # deepseek-v4-flash-vision-exp needs no entry: an id that names `vision` (or
   # `vl`) is read as vision-capable even outside the claude family. Pin it here
   # only to contradict that — either way an explicit entry always wins.
+  # Xiaomi reports no capabilities but mimo-v2.5 can see: pin it so its image
+  # turns stay on Xiaomi instead of being redirected to the Anthropic leg.
+  mimo-v2.5:
+    vision: true
+  mimo-v2.5-pro:
+    vision: true
 
 # Anthropic credential bridge. Claude Code only runs gateway model discovery
 # when ANTHROPIC_AUTH_TOKEN is set, and that value would otherwise override your

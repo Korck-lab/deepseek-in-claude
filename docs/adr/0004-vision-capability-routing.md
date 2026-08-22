@@ -13,7 +13,9 @@ family keeps its own image turns.)
 
 ## Context
 
-DeepSeek V4 models have no vision. A Claude Code request whose body carries an
+The base DeepSeek V4 models (`deepseek-v4-flash`, `deepseek-v4-pro`) have no
+vision — `deepseek-v4-flash-vision-exp` does, and is the reason capability is
+detected per model, not per family. A Claude Code request whose body carries an
 image block — pasted into the prompt, dropped into the context, or returned by a
 tool — used to 400 upstream, because DeepSeek's Anthropic-compatible endpoint
 rejected `{"type":"image"}` content it could not process.

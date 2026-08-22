@@ -15,7 +15,7 @@
  *
  * Config precedence: CLI args > config.yml > .env > defaults.
  * Env vars: DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL,
- *           DEEPSEEK_ANTHROPIC_BASE_URL, PORT
+ *           DEEPSEEK_ANTHROPIC_BASE_URL, XIOMIMIMO_API_KEY, XIOMIMIMO_BASE_URL, PORT
  *
  * Zero runtime dependencies — Node built-ins only. Requires Node 18+.
  */
@@ -296,6 +296,40 @@ const DEEPSEEK_MODEL = (process.env.DEEPSEEK_MODEL ?? ENV.DEEPSEEK_MODEL ?? "")
 const FALLBACK_MODELS = ["deepseek-v4-pro", "deepseek-v4-flash"];
 const DEFAULT_MODELS = DEEPSEEK_MODEL.length ? DEEPSEEK_MODEL : FALLBACK_MODELS;
 
+// Xiaomi MiMo — second provider. The .env value carries the /anthropic suffix
+// the Anthropic leg needs, so the discovery root is derived by stripping it.
+const XIOMIMIMO_API_KEY = process.env.XIOMIMIMO_API_KEY ?? ENV.XIOMIMIMO_API_KEY ?? "";
+const XIOMIMIMO_BASE_URL = (process.env.XIOMIMIMO_BASE_URL ?? ENV.XIOMIMIMO_BASE_URL ?? "https://token-plan-sgp.xiaomimimo.com").replace(/\/+$/, "");
+const XIOMIMIMO_ANTHROPIC_BASE = (process.env.XIOMIMIMO_ANTHROPIC_BASE_URL ?? (XIOMIMIMO_BASE_URL.endsWith("/anthropic") ? XIOMIMIMO_BASE_URL : `${XIOMIMIMO_BASE_URL}/anthropic`)).replace(/\/+$/, "");
+const XIOMIMIMO_ROOT = XIOMIMIMO_ANTHROPIC_BASE.replace(/\/anthropic$/, "");
+
+// One entry per provider leg. `prefix` is the display-id prefix Claude Code
+// needs (`/(claude|anthropic)/i` drops anything else), `stripRe` removes the
+// vendor part of a real id when building the display id, `windowDefault` is the
+// context-window claim used when the model list reports nothing (null = unknown,
+// so no 1M claim), and `exclude` drops model-list entries Claude Code can't use.
+const PROVIDERS = {
+  deepseek: {
+    name: "DeepSeek",
+    apiKey: DEEPSEEK_API_KEY,
+    root: DEEPSEEK_BASE_URL,
+    anthropicBase: DEEPSEEK_ANTHROPIC_BASE,
+    prefix: "claude-deepseek-",
+    stripRe: /^deepseek-/,
+    windowDefault: 1_000_000,
+  },
+  xiaomi: {
+    name: "Mimo",
+    apiKey: XIOMIMIMO_API_KEY,
+    root: XIOMIMIMO_ROOT,
+    anthropicBase: XIOMIMIMO_ANTHROPIC_BASE,
+    prefix: "claude-",
+    stripRe: /^/,
+    windowDefault: null,
+    exclude: /-(asr|tts)(-|$)/i, // audio models aren't usable in Claude Code
+  },
+};
+
 /** Rough token estimate for count_tokens. */
 const estTokens = (bytes) => Math.round(bytes / 4);
 
@@ -420,9 +454,11 @@ let refreshInFlight = null;
 // ---------------------------------------------------------------------------
 // Vision redirect config
 //
-// DeepSeek V4 models have no vision; a request carrying an image block 400s
-// upstream. When the resolved target model lacks vision capability, such a
-// request is rerouted to a model that can see it. Two tiers, tried in order:
+// The base DeepSeek V4 models have no vision (deepseek-v4-flash-vision-exp is the
+// vision-capable exception, detected by id — see VISION_IN_ID). A request carrying
+// an image block to a vision-less target upstream answers blind. When the resolved
+// target model lacks vision capability, such a request is rerouted to a model that
+// can see it. Two tiers, tried in order:
 //
 //   1. A local vision model — LM Studio by default, which speaks OpenAI
 //      protocol, so that leg translates Anthropic <-> OpenAI rather than reusing
@@ -438,8 +474,8 @@ let refreshInFlight = null;
 //      `vision.anthropic: false` turns it off and restores the blind answer,
 //      with a warning.
 //
-// With both off, the image turn goes to DeepSeek, which answers 200 without
-// having seen the image, and the disabled path says which setting would have
+// With both off, the image turn goes to the vision-less model, which answers 200
+// without having seen the image, and the disabled path says which setting would have
 // handled it. Measured 2026-08-21: DeepSeek used to reject `{"type":"image"}`
 // with a 400; it now accepts the block and hallucinates instead — asked the
 // colour of a solid red pixel it answered "blue". A wrong answer nobody can
@@ -682,7 +718,7 @@ let dsModelsInFlight = null;
 // reported, defaulted otherwise" rather than a hardcoded DeepSeek-to-Anthropic
 // rule.
 //
-// Declared above refreshDeepseekIds() on purpose: that call fires at module
+// Declared above refreshProviderIds() on purpose: that call fires at module
 // init and its model-list reader writes here, so the binding has to exist by
 // then rather than depend on an await to escape the temporal dead zone.
 // ---------------------------------------------------------------------------
@@ -719,51 +755,90 @@ function capabilityOf(id) {
   return visionDefaultFor(id);
 }
 
-// Real DeepSeek model ids this proxy will route to upstream.
-let deepseekIds = new Set(DEFAULT_MODELS);
+// Real model ids per provider this proxy will route to upstream. Seeded with
+// DeepSeek's fallback list so a request arriving before the first fetch can
+// still resolve `claude-deepseek-v4-flash[1m]` — empty, it would fall through to
+// Anthropic and come back 401/404 instead of routing. Xiaomi starts empty; its
+// models only exist once the fetch lands.
+const PROVIDER_IDS = { deepseek: new Set(DEFAULT_MODELS), xiaomi: new Set() };
+
 // Display id -> real id. Claude Code's gateway model discovery drops any model
-// whose id fails /(claude|anthropic)/i, so we serve DeepSeek models under a
-// `claude-deepseek-*` display id and rewrite it back to the real id on request.
-const DISPLAY_PREFIX = "claude-deepseek-";
-// Claude Code sizes the context window of a model it doesn't know from the id
-// itself: a `[1m]` suffix (case-insensitive, matched by regex, no catalog
-// lookup) means a 1M window; anything else falls back to 200k. The
-// `CLAUDE_CODE_MAX_CONTEXT_TOKENS` env var can't substitute here — it is
-// ignored for any id starting with `claude-`, which the discovery filter forces
-// on us. The suffix is stripped again before the request reaches DeepSeek.
-const DISPLAY_SUFFIX = "[1m]";
+// whose id fails /(claude|anthropic)/i, so both providers are served under a
+// `claude-*` display id and rewritten back to the real id on request.
 const stripWindowSuffix = (id) => String(id).replace(/\[1m\]$/i, "");
 
+// Effective context window per real model id — what decides the `[1m]` suffix.
+// Seeded from the provider default; a model list that reports one wins (see
+// readContextWindow).
+const windowByModel = new Map();
+
+/** Read a reported context window off a model-list entry. Anthropic's list
+ * carries it; DeepSeek's and Xiaomi's do not today. Silent when absent. */
+function readContextWindow(entry) {
+  const w = entry?.context_window ?? entry?.max_context_length;
+  if (typeof w === "number" && w > 0 && typeof entry?.id === "string") windowByModel.set(entry.id, w);
+}
+
+/** How big a window earns the `[1m]` suffix. Claude Code sizes a model it
+ * doesn't know from the id alone: `[1m]` means 1M, anything else falls back to
+ * 200k. Claiming 1M for a model without it quietly truncates long sessions, so
+ * only a reported-or-known window over the threshold is claimed. */
+function windowSuffixOf(window) {
+  return window != null && window >= 750_000 ? "[1m]" : "";
+}
+
+function windowFor(id) {
+  const reported = windowByModel.get(id);
+  if (reported !== undefined) return reported;
+  const owner = ownerOf(id);
+  return owner ? PROVIDERS[owner].windowDefault : null;
+}
+
+/** Which provider owns a real id, or null. */
+function ownerOf(id) {
+  if (typeof id !== "string") return null;
+  for (const [name, set] of Object.entries(PROVIDER_IDS)) if (set.has(id)) return name;
+  return null;
+}
+
+/** The display id Claude Code sees for a real id: provider prefix, the id with
+ * its vendor prefix stripped, and the window suffix it earned. */
 function displayIdOf(id) {
-  return `${DISPLAY_PREFIX}${String(id).replace(/^deepseek-/, "")}${DISPLAY_SUFFIX}`;
+  const owner = ownerOf(id);
+  const p = owner ? PROVIDERS[owner] : null;
+  if (!p) return String(id);
+  const bare = String(id).replace(p.stripRe, "");
+  return `${p.prefix}${bare}${windowSuffixOf(windowFor(id))}`;
 }
 
 /** Both the suffixed display id and its bare form map to the real id — Claude
  * Code keeps both in play when it resolves a model name. */
-function buildDisplayMap(ids) {
-  return new Map(
-    [...ids].flatMap((id) => {
+function buildDisplayMap() {
+  const out = new Map();
+  for (const ids of Object.values(PROVIDER_IDS)) {
+    for (const id of ids) {
       const display = displayIdOf(id);
-      return [
-        [display, id],
-        [stripWindowSuffix(display), id],
-      ];
-    })
-  );
+      out.set(display, id);
+      out.set(stripWindowSuffix(display), id);
+    }
+  }
+  return out;
 }
 
-// Seeded from the fallback list rather than left empty until the first fetch
-// lands. Empty, a request arriving during startup could not resolve
-// `claude-deepseek-v4-flash[1m]` — the id the picker actually sends — so it fell
-// through to Anthropic and came back 401/404 instead of routing to DeepSeek.
-let displayToReal = buildDisplayMap(DEFAULT_MODELS);
+let displayToReal = buildDisplayMap();
 
 function displayNameOf(id) {
-  const pretty = String(id)
-    .replace(/^deepseek-/, "")
-    .replace(/-/g, " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
-  return `DeepSeek ${pretty}`;
+  const owner = ownerOf(id);
+  const p = owner ? PROVIDERS[owner] : null;
+  if (!p) return String(id);
+  // The real id often carries the vendor name too ("mimo-v2.5"); drop it so the
+  // display name is "Mimo V2.5", not "Mimo Mimo V2.5".
+  let bare = String(id).replace(p.stripRe, "");
+  if (bare.toLowerCase().startsWith(p.name.toLowerCase())) {
+    bare = bare.slice(p.name.length).replace(/^[-_\s]+/, "");
+  }
+  const pretty = bare.replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  return `${p.name} ${pretty}`;
 }
 
 function toModelEntry(id, created) {
@@ -775,75 +850,103 @@ function toModelEntry(id, created) {
   };
 }
 
-/** The DeepSeek model list, cached for MODEL_CACHE_TTL.
+/** The merged provider model list, cached for MODEL_CACHE_TTL.
  *
  * Serialised through a single in-flight promise: the TTL check and the cache
  * write are far apart (a network round trip), so concurrent callers would all
- * see an empty cache, all fetch, and all clobber `deepseekIds` /
- * `displayToReal` in whatever order they happened to finish. Claude Code opens
- * several /v1/models requests at once at startup, so this is the common path,
- * not an edge case. */
-async function deepseekModelList() {
-  if (dsModelsCache.models && Date.now() - dsModelsCache.at < MODEL_CACHE_TTL) return dsModelsCache.models;
-  if (!dsModelsInFlight) {
-    dsModelsInFlight = fetchDeepseekModelList().finally(() => {
-      dsModelsInFlight = null;
+ * see an empty cache, all fetch, and all clobber `PROVIDER_IDS` /
+ * `displayToReal` / `windowByModel` in whatever order they happened to finish.
+ * Claude Code opens several /v1/models requests at once at startup, so this is
+ * the common path, not an edge case. */
+let providerModelsCache = { at: 0, list: null };
+let providerModelsInFlight = null;
+
+async function providerModelList() {
+  if (providerModelsCache.list && Date.now() - providerModelsCache.at < MODEL_CACHE_TTL) return providerModelsCache.list;
+  if (!providerModelsInFlight) {
+    providerModelsInFlight = fetchProviderModelLists().finally(() => {
+      providerModelsInFlight = null;
     });
   }
-  return dsModelsInFlight;
+  return providerModelsInFlight;
 }
 
-async function fetchDeepseekModelList() {
-  const models = new Map();
-  for (const id of DEFAULT_MODELS) models.set(id, toModelEntry(id, 0));
-  if (DEEPSEEK_API_KEY) {
+async function fetchProviderModelLists() {
+  const [ds, xm] = await Promise.all([fetchProviderList("deepseek"), fetchProviderList("xiaomi")]);
+  const list = [...ds, ...xm];
+  providerModelsCache = { at: Date.now(), list };
+  return list;
+}
+
+/** Fetch one provider's model list, fold it into the routing state, and return
+ * its display entries. The seed (DeepSeek's fallback list) is what keeps that
+ * provider working before its fetch lands. */
+async function fetchProviderList(name) {
+  const p = PROVIDERS[name];
+  // Build the real-id set FIRST, then map every entry from it. toModelEntry ->
+  // displayIdOf -> ownerOf read PROVIDER_IDS, so mapping as the set grows would
+  // leave every fetched (non-seed) model with a raw id — the set is only
+  // assigned at the end. Both the routing map and the picker list have to agree
+  // with each other, so they are built from the same final set.
+  const realIds = new Set(name === "deepseek" ? DEFAULT_MODELS : []);
+  const created = new Map();
+  for (const id of realIds) windowByModel.set(id, p.windowDefault);
+  if (p.apiKey) {
     try {
-      const { status, json } = await fetchJson(`${DEEPSEEK_BASE_URL}/models`, {
-        headers: { authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+      const { status, json } = await fetchJson(`${p.root}/models`, {
+        headers: { authorization: `Bearer ${p.apiKey}` },
       });
       if (status === 200 && json?.data) {
         for (const m of json.data) {
           if (!m?.id) continue;
-          models.set(m.id, toModelEntry(m.id, m.created ?? 0));
-          // DeepSeek does not report capabilities today, so this reads nothing
-          // and the family default (no vision) stands. It exists so that a model
-          // list which *does* start reporting image_input needs no code change —
-          // the vision redirect stops firing for that model on its own.
+          if (p.exclude && p.exclude.test(m.id)) continue;
+          realIds.add(m.id);
+          created.set(m.id, m.created ?? 0);
+          // Read both before mapping: a reported window decides the [1m] suffix
+          // that goes into the display id the picker lists.
           readVisionCapability(m);
+          readContextWindow(m);
         }
       }
     } catch {
-      /* models fetch failed — fallback list stands */
+      /* models fetch failed — seed/fallback stands */
     }
   }
-  const list = [...models.values()];
-  deepseekIds = new Set(models.keys());
-  displayToReal = buildDisplayMap(models.keys());
-  dsModelsCache = { at: Date.now(), models: list };
-  return list;
+  PROVIDER_IDS[name] = realIds;
+  displayToReal = buildDisplayMap();
+  return [...realIds].map((id) => toModelEntry(id, created.get(id) ?? 0));
 }
 
-async function refreshDeepseekIds() {
+async function refreshProviderIds() {
   try {
-    await deepseekModelList();
+    await providerModelList();
   } catch {
     /* keep fallback */
   }
 }
-refreshDeepseekIds();
+refreshProviderIds();
 
-/** Real DeepSeek id for a request model id, or null if not a DeepSeek model.
- * Accepts both the display id (`claude-deepseek-v4-flash`) and the real id. */
-const deepseekRealId = (id) => {
+/** Resolve a request model id to its provider and real id, or null if it is not
+ * a provider model. Accepts both the display id (`claude-deepseek-v4-flash[1m]`,
+ * `claude-mimo-v2.5`) and the bare real id. */
+const providerOf = (id) => {
   if (typeof id !== "string") return null;
-  if (deepseekIds.has(id)) return id;
-  if (displayToReal.has(id)) return displayToReal.get(id);
-  // `deepseek-v4-flash[1m]` would 400 upstream — the window suffix is a Claude
-  // Code convention, never part of a real model id.
+  for (const [name, set] of Object.entries(PROVIDER_IDS)) if (set.has(id)) return { provider: name, real: id };
+  if (displayToReal.has(id)) {
+    const real = displayToReal.get(id);
+    return { provider: ownerOf(real), real };
+  }
+  // `mimo-v2.5[1m]` would 400 upstream — the window suffix is a Claude Code
+  // convention, never part of a real model id.
   const bare = stripWindowSuffix(id);
-  if (deepseekIds.has(bare)) return bare;
-  return displayToReal.get(bare) ?? null;
+  for (const [name, set] of Object.entries(PROVIDER_IDS)) if (set.has(bare)) return { provider: name, real: bare };
+  if (displayToReal.has(bare)) {
+    const real = displayToReal.get(bare);
+    return { provider: ownerOf(real), real };
+  }
+  return null;
 };
+
 
 /** Claude Code / Opus 5 effort levels: low, medium, high, xhigh, max. DeepSeek
  * V4 accepts all five natively, so nothing is bridged by default and this map
@@ -895,16 +998,17 @@ function decodeSse(raw) {
 }
 
 // ---------------------------------------------------------------------------
-// DeepSeek routing — transparent passthrough to the Anthropic-compatible API
+// Provider routing — transparent passthrough to each Anthropic-compatible API
 // ---------------------------------------------------------------------------
 
 /** `opts.fallbackFrom` names the leg that gave up on this turn, when the turn
  * only reached DeepSeek because the Anthropic leg failed. It exists for the usage
- * log: a fallback spends DeepSeek credits on a request the user aimed at
+ * log: a fallback spends provider credits on a request the user aimed at
  * Anthropic, and without the tag those rows are indistinguishable from deliberate
- * DeepSeek use — which is exactly the question asked after the fact. Same reason
+ * provider use — which is exactly the question asked after the fact. Same reason
  * the vision redirect threads `opts.redirected`. */
-function handleDeepSeek(req, res, body, reqPath, redir, opts = {}) {
+function forwardToProviderLeg(req, res, body, reqPath, redir, opts = {}, providerName) {
+  const provider = PROVIDERS[providerName];
   if (isTokenCount(reqPath)) {
     const est = estTokens(body.length);
     res.writeHead(200, { "content-type": "application/json" });
@@ -919,7 +1023,7 @@ function handleDeepSeek(req, res, body, reqPath, redir, opts = {}) {
   try {
     const reqJson = JSON.parse(body.toString("utf8"));
     let changed = false;
-    const real = reqJson?.model ? deepseekRealId(reqJson.model) : null;
+    const real = reqJson?.model ? providerOf(reqJson.model)?.real ?? null : null;
     // The *canonical* display id, not the string the client happened to send.
     // Claude Code strips `[1m]` before dispatching, so echoing back what it sent
     // would put a suffix-less id in the transcript — and a resumed session reads
@@ -951,15 +1055,15 @@ function handleDeepSeek(req, res, body, reqPath, redir, opts = {}) {
   }
 
   const headers = forwardHeaders(req.headers, forwardedBody);
-  headers["x-api-key"] = DEEPSEEK_API_KEY;
-  delete headers["authorization"]; // DeepSeek wants the key as x-api-key only
+  headers["x-api-key"] = provider.apiKey;
+  delete headers["authorization"]; // these providers want the key as x-api-key only
   // anthropic-version / anthropic-beta pass through; DeepSeek ignores them.
 
   let u;
   try {
-    u = new URL(DEEPSEEK_ANTHROPIC_BASE + reqPath);
+    u = new URL(provider.anthropicBase + reqPath);
   } catch (err) {
-    sendError(res, 500, "api_error", `deepseek route error: ${err.message}`);
+    sendError(res, 500, "api_error", `${providerName} route error: ${err.message}`);
     return;
   }
 
@@ -970,7 +1074,7 @@ function handleDeepSeek(req, res, body, reqPath, redir, opts = {}) {
 
   // One client response, one writer. Once the fallback path hands `res` to
   // forwardToAnthropic this leg must never touch it again: a late socket error
-  // on the abandoned DeepSeek request would otherwise either destroy a response
+  // on the abandoned upstream request would otherwise either destroy a response
   // the Anthropic leg is midway through streaming, or — if it errored before
   // that leg wrote its head, so `headersSent` is still false — start a *second*
   // fallback on the same response.
@@ -998,7 +1102,7 @@ function handleDeepSeek(req, res, body, reqPath, redir, opts = {}) {
           up.resume(); // drain so the socket frees
           handedOff = true;
           clearUpstreamTimeout();
-          void forwardToAnthropic(req, res, reqPath, body, null, { fallbackFrom: "deepseek" }).catch((err) => sendError(res, 502, "api_error", err.message)); // original model + body
+          void forwardToAnthropic(req, res, reqPath, body, null, { fallbackFrom: providerName }).catch((err) => sendError(res, 502, "api_error", err.message)); // original model + body
           return;
         }
         if (status === 200) {
@@ -1044,16 +1148,16 @@ function handleDeepSeek(req, res, body, reqPath, redir, opts = {}) {
         up.on("data", (c) => chunks.push(c));
         up.on("end", () => {
           const raw = Buffer.concat(chunks).toString("utf8");
-          // DeepSeek rejects tool types it doesn't know with a 400 naming the
-          // offending index; dropping that tool and retrying is what keeps a
+          // The upstream rejects tool types it doesn't know with a 400 naming
+          // the offending index; dropping that tool and retrying is what keeps a
           // Claude Code session with newer tools usable. The index is read out
-          // of a prose error message, so the shape is DeepSeek's to change —
+          // of a prose error message, so the shape is the provider's to change —
           // when the marker is there but the index isn't, say so rather than
           // forwarding an opaque 400 the user can do nothing with.
           const unknownVariant = status === 400 && raw.includes("unknown variant");
           const m = unknownVariant ? raw.match(/tools\[(\d+)\]/) : null;
           if (unknownVariant && !m) {
-            warnOnce(`DeepSeek rejected an unknown tool variant but the error named no tools[N] index — cannot retry: ${raw.slice(0, 200)}`, "deepseek");
+            warnOnce(`${provider.name} rejected an unknown tool variant but the error named no tools[N] index — cannot retry: ${raw.slice(0, 200)}`, providerName);
           }
           if (m && attempts < 3) {
             const idx = Number(m[1]);
@@ -1086,7 +1190,7 @@ function handleDeepSeek(req, res, body, reqPath, redir, opts = {}) {
       if (res.headersSent) { res.destroy(); return; }
       if (FALLBACK && redir) {
         handedOff = true;
-        void forwardToAnthropic(req, res, reqPath, body, null, { fallbackFrom: "deepseek" }).catch((e) => sendError(res, 502, "api_error", e.message));
+        void forwardToAnthropic(req, res, reqPath, body, null, { fallbackFrom: providerName }).catch((e) => sendError(res, 502, "api_error", e.message));
         return;
       }
       // Mirror of the same case on the Anthropic leg: a crossing that then failed
@@ -1094,12 +1198,20 @@ function handleDeepSeek(req, res, body, reqPath, redir, opts = {}) {
       if (opts.fallbackFrom) {
         logUsage({ method: req.method, path: reqPath, status: 502, ms: Date.now() - started, model: sentModel, usage: null, fallbackFrom: opts.fallbackFrom, error: err.message });
       }
-      sendError(res, 502, "api_error", `deepseek upstream error: ${err.message}`);
+      sendError(res, 502, "api_error", `${providerName} upstream error: ${err.message}`);
     });
     if (attemptBody.length > 0) upstream.write(attemptBody);
     upstream.end();
   }
   issueUpstream(1, forwardedBody);
+}
+
+function handleDeepSeek(req, res, body, reqPath, redir, opts = {}) {
+  return forwardToProviderLeg(req, res, body, reqPath, redir, opts, "deepseek");
+}
+
+function handleXiaomi(req, res, body, reqPath, redir, opts = {}) {
+  return forwardToProviderLeg(req, res, body, reqPath, redir, opts, "xiaomi");
 }
 
 // ---------------------------------------------------------------------------
@@ -1132,17 +1244,17 @@ async function serveModels(req, res) {
     upstream.end();
   });
 
-  const ds = await deepseekModelList();
+  const providerList = await providerModelList();
 
-  // Never brick the harness on an Anthropic hiccup — serve DeepSeek models only.
+  // Never brick the harness on an Anthropic hiccup — serve provider models only.
   // But say so: an empty or partial picker is the most visible symptom this
   // proxy has, and silently returning half a list sends people hunting through
   // Claude Code's model cache for a fault that is upstream of it.
   if (!Array.isArray(anthropicModels.json?.data)) {
     warnOnce(
       anthropicModels.status === 0
-        ? "could not reach api.anthropic.com for the model list — serving DeepSeek models only"
-        : `api.anthropic.com returned ${anthropicModels.status} for the model list — serving DeepSeek models only`,
+        ? "could not reach api.anthropic.com for the model list — serving provider models only"
+        : `api.anthropic.com returned ${anthropicModels.status} for the model list — serving provider models only`,
       "models"
     );
   }
@@ -1156,7 +1268,7 @@ async function serveModels(req, res) {
 
   const data = Array.isArray(anthropicModels.json?.data) ? [...anthropicModels.json.data] : [];
   const seen = new Set(data.map((m) => m.id));
-  for (const m of ds) if (!seen.has(m.id)) data.push(m);
+  for (const m of providerList) if (!seen.has(m.id)) data.push(m);
 
   res.writeHead(200, { "content-type": "application/json" });
   res.end(
@@ -1236,7 +1348,7 @@ function rewriteModel(body, model) {
 
 async function forwardToAnthropic(req, res, reqPath, body, fb, opts = {}) {
   const headers = await applyAnthropicAuth(forwardHeaders(req.headers, body));
-  // Mirror image of the guard in handleDeepSeek: once this leg falls back, the
+  // Mirror image of the guard in forwardToProviderLeg: once this leg falls back, the
   // DeepSeek leg owns the response and a late error here must not touch it.
   let handedOff = false;
   const started = Date.now();
@@ -1265,7 +1377,7 @@ async function forwardToAnthropic(req, res, reqPath, body, fb, opts = {}) {
         // that field — so a redirected turn must echo the client's display id,
         // not the vision model. Hold bytes only until the first SSE event is
         // complete, rewrite the `model` field, stream the rest. Mirror of the
-        // head-buffering in handleDeepSeek; only the redirect leg needs it, a
+        // head-buffering in forwardToProviderLeg; only the redirect leg needs it, a
         // plain Anthropic passthrough streams straight through.
         const respChunks = [];
         let head = Buffer.alloc(0);
@@ -1627,9 +1739,9 @@ function handle(req, res) {
       // rows, so only the DeepSeek entries have to be seeded. Named outside /v1
       // so it can never collide with a real Anthropic route.
       if (req.method === "GET" && reqPath === "/_proxy/deepseek-models") {
-        const ds = await deepseekModelList();
+        const list = await providerModelList();
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ data: ds, has_more: false }));
+        res.end(JSON.stringify({ data: list, has_more: false }));
         return;
       }
       if (req.method === "GET" && reqPath.startsWith("/v1/models")) {
@@ -1647,17 +1759,17 @@ function handle(req, res) {
       // route time, not left to 400 upstream. Independent of the retry-on-error
       // fallback — and the redirect leg forwards with fb null on purpose, so a
       // later failure cannot re-send the image to the vision-less model.
-      const dsReal = model ? deepseekRealId(model) : null;
-      const dsTarget = dsReal ?? (fam && redirOn ? REDIR_MAP[fam] : null);
-      const needsVision = !isTokenCount(reqPath) && dsTarget && capabilityOf(dsTarget) === false && hasImageBlock(body);
+      const hit = model ? providerOf(model) : null;
+      const providerReal = hit?.real ?? (fam && redirOn ? REDIR_MAP[fam] : null);
+      const needsVision = !isTokenCount(reqPath) && providerReal && capabilityOf(providerReal) === false && hasImageBlock(body);
       if (needsVision) {
-        // Echo exactly what the normal DeepSeek path would have echoed: the
-        // canonical display id for a DeepSeek model, and the client's own string
+        // Echo exactly what the normal provider path would have echoed: the
+        // canonical display id for a provider model, and the client's own string
         // for a family name being redir-routed. Answering a `--redir --model
         // sonnet` turn with a DeepSeek display id would flip the session model
         // on the user — the same failure ADR-0004 redirects to avoid, pointed
         // the other way. Both tiers echo the same id, for the same reason.
-        const echo = dsReal ? displayIdOf(dsReal) : model;
+        const echo = hit ? displayIdOf(hit.real) : model;
         // Local first: it is opt-in, so a user who configured it asked for it by
         // name, and it costs no plan traffic. The Anthropic tier is the default
         // catch, not the preference.
@@ -1686,10 +1798,10 @@ function handle(req, res) {
         // Both tiers off: the turn is about to 400 upstream on a body the model
         // cannot read. That failure reads like a CLI or model-support problem,
         // so name the settings that change it rather than letting the 400 speak.
-        warnOnce(`image sent to ${dsTarget}, which cannot see it — the turn will answer anyway, without the image. Set \`vision.anthropic\` back on to answer it on the Anthropic leg, or \`vision.redirect: true\` to route image turns to a local vision model.`, "vision");
+        warnOnce(`image sent to ${providerReal}, which cannot see it — the turn will answer anyway, without the image. Set \`vision.anthropic\` back on to answer it on the Anthropic leg, or \`vision.redirect: true\` to route image turns to a local vision model.`, "vision");
       }
-      if (model && deepseekRealId(model)) {
-        handleDeepSeek(req, res, body, reqPath, null);
+      if (hit) {
+        (hit.provider === "xiaomi" ? handleXiaomi : handleDeepSeek)(req, res, body, reqPath, null);
         return;
       }
       if (fam && redirOn) {
