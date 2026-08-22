@@ -107,8 +107,9 @@ http.createServer((req, res) => {
   req.on("end", () => {
     // Provider model lists (the second-provider fetch path). mimno-v2.5-pro
     // reports a 1M window so the [1m] suffix is testable; the -asr/-tts ids are
-    // what the proxy must filter out of the picker.
-    if (req.url.startsWith("/models")) {
+    // what the proxy must filter out of the picker. Served on both /models and
+    // /v1/models because each provider's list lives on a different path.
+    if (req.url === "/models" || req.url === "/v1/models") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ data: [
         { id: "mimo-v2.5", object: "model", created: 1, owned_by: "xiaomi" },

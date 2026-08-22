@@ -43,16 +43,18 @@ const PROVIDERS = {
               name: "DeepSeek", stripRe: /^deepseek-/, exclude: null },
   xiaomi:   { apiKey: XIOMIMIMO_API_KEY, anthropicBase: XIOMIMIMO_ANTHROPIC_BASE,
               root: XIOMIMIMO_ROOT, prefix: "claude-", windowDefault: null,
-              name: "Mimo", stripRe: /^/, exclude: /-(asr|tts)(-|$)/i },
+              name: "Mimo", stripRe: /^/, exclude: /-(asr|tts)(-|$)/i,
+              modelsPath: "/v1/models" },
 };
 ```
 
 - **Model discovery is per-provider, union-served.** `providerModelList()` fetches each
-  provider's `/v1/models` (single in-flight promise, 10-minute cache, `.env` seed
-  fallback), filters `exclude`, reads vision capability and context window per model,
-  and builds the union — served by both `GET /v1/models` and the `/_proxy/deepseek-models`
-  seeding endpoint. Providers without a key contribute nothing; DeepSeek always seeds
-  from `DEEPSEEK_MODEL`.
+  provider's model list — DeepSeek at `<root>/models`, Xiaomi at `<root>/v1/models`,
+  per the `modelsPath` table entry (single in-flight promise, 10-minute cache, `.env`
+  seed fallback) — filters `exclude`, reads vision capability and context window per
+  model, and builds the union — served by both `GET /v1/models` and the
+  `/_proxy/deepseek-models` seeding endpoint. Providers without a key contribute
+  nothing; DeepSeek always seeds from `DEEPSEEK_MODEL`.
 - **Routing is per-provider via `providerOf(id)`.** `providerOf` resolves a client model
   id to `{ provider, real }` by checking each provider's real-id set, then the display
   map (suffixed and bare — the bare form is what Claude Code sends after stripping the

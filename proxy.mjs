@@ -327,6 +327,7 @@ const PROVIDERS = {
     stripRe: /^/,
     windowDefault: null,
     exclude: /-(asr|tts)(-|$)/i, // audio models aren't usable in Claude Code
+    modelsPath: "/v1/models",     // Xiaomi's list lives at /v1/models, not /models
   },
 };
 
@@ -893,7 +894,7 @@ async function fetchProviderList(name) {
   for (const id of realIds) windowByModel.set(id, p.windowDefault);
   if (p.apiKey) {
     try {
-      const { status, json } = await fetchJson(`${p.root}/models`, {
+      const { status, json } = await fetchJson(`${p.root}${p.modelsPath ?? "/models"}`, {
         headers: { authorization: `Bearer ${p.apiKey}` },
       });
       if (status === 200 && json?.data) {
